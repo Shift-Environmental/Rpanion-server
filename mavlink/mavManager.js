@@ -92,7 +92,8 @@ class mavManager {
       // set the target system/comp ID if needed
       // ensure it's NOT a GCS, as mavlink-router will sometimes route
       // messages from connected GCS's
-      if (this.targetSystem === null && packet.header.msgid === minimal.Heartbeat.MSG_ID && data.type !== 6) {
+      if (this.targetSystem === null && packet.header.msgid === minimal.Heartbeat.MSG_ID && data.type !== 6
+        && data.type !== 18) {
         console.log('Vehicle is S/C: ' + packet.header.sysid + '/' + packet.header.compid)
         winston.info('Vehicle is S/C: ' + packet.header.sysid + '/' + packet.header.compid)
         this.targetSystem = packet.header.sysid
@@ -113,7 +114,7 @@ class mavManager {
         packet.header.msgid === common.CommandLong.MSG_ID) {
         console.log('Received CommandLong addressed to attached camera')
 
-      } else if (this.targetSystem !== packet.header.sysid) {
+      } else if (this.targetSystem !== packet.header.sysid || this.targetComponent !== packet.header.compid) {
         // don't use packets from other systems or components in Rpanion-server
         return
       }
@@ -359,18 +360,19 @@ class mavManager {
     let buf = Buffer.from(gpmessage)
     const msgset = []
     const maxBytes = 180
-    while (true) {
-      if (buf.length > maxBytes) {
+    while (buf.length > maxBytes) {
+      //if (buf.length > maxBytes) {
         // slice
         msgset.push(buf.slice(0, maxBytes))
         buf = buf.slice(maxBytes)
-      } else {
+      //} else {
         // need to pad to 180 chars? No, message packing
         // will do this for us
-        msgset.push(buf)
-        break
-      }
+      //  msgset.push(buf)
+      //  break
+      //}
     }
+    msgset.push(buf)
 
     for (let i = 0, len = msgset.length; i < len; i++) {
       const msg = new common.GpsRtcmData()
