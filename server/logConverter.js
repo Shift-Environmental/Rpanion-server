@@ -1,7 +1,7 @@
 const spawn = require('child_process').spawn
 const path = require('path')
 const appRoot = require('app-root-path')
-const winston = require('./winstonconfig')(module)
+const logpaths = require('./paths.js')
 
 class logConverter {
   constructor (settings) {
@@ -26,19 +26,18 @@ class logConverter {
       if (this.options.doLogConversion) {
         try {
           console.log('Doing log conversion...')
-          this.converterPid = spawn('python3', [this.pythonScript])
+          this.converterPid = spawn('python3', [this.pythonScript, logpaths.flightsLogsDir])
           this.converterPid.stdout.on('data', (data) => {
             console.log(`stdout from log converter: ${data}`)
           })
           this.converterPid.stderr.on('data', (data) => {
-            console.error(`stderr from log converter: ${data}`)
+            console.log(`stderr from log converter: ${data}`)
           })
           this.converterPid.on('close', (code) => {
             console.log(`Log converter exited with code ${code}`)
           })
         } catch (error) {
-          console.error(error)
-          winston.info(error.stack)
+          console.log(error)
         }
       }
     }, this.options.interval * 1000)
@@ -63,10 +62,8 @@ class logConverter {
     try {
       this.settings.setValue('logConverter.doLogConversion', this.options.doLogConversion)
       console.log('Saved Log Converter settings')
-      winston.info('Saved Log Converter settings')
     } catch (e) {
       console.log(e)
-      winston.info(e)
     }
   }
 

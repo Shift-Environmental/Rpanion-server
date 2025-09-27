@@ -4,6 +4,7 @@ const compression = require('compression')
 const bodyParser = require('body-parser')
 const pino = require('pino-http')()
 const process = require('process')
+const jwt = require('jsonwebtoken');
 const { common } = require('node-mavlink')
 
 const networkManager = require('./networkManager')
@@ -17,21 +18,33 @@ const Adhoc = require('./adhocManager.js')
 const cloudManager = require('./cloudUpload.js')
 const VPNManager = require('./vpn')
 const logConversionManager = require('./logConverter.js')
-const winston = require('./winstonconfig')(module)
+const userLogin = require('./userLogin.js')
+const logpaths = require('./paths.js')
 
-const appRoot = require('app-root-path')
 const settings = require('settings-store')
 
 const app = express()
 const http = require('http').Server(app)
 const path = require('path')
 
+const io = require('socket.io')(http, { cookie: false })
+const { check, validationResult } = require('express-validator')
+const crypto = require('crypto');
+
 // set up rate limiter: maximum of fifty requests per minute
 const RateLimit = require('express-rate-limit')
+const pppConnection = require('./pppConnection.js')
 const limiter = RateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
   max: 50
 })
+
+// Generate a new key if not provided
+function generateSecretKey() {
+  return crypto.randomBytes(64).toString('hex');
+}
+const RPANION_SECRET_KEY = process.env.RPANION_SECRET_KEY || generateSecretKey();
+let tokenBlacklist = [];
 
 // apply rate limiter to all requests
 app.use(limiter)
@@ -39,35 +52,61 @@ app.use(limiter)
 // use file uploader for Wireguard profiles
 app.use(fileUpload({ limits: { fileSize: 500 }, abortOnLimit: true, useTempFiles: true, tempFileDir: '/tmp/', safeFileNames: true, preserveExtension: 4 }))
 
-const io = require('socket.io')(http, { cookie: false })
-const { check, validationResult } = require('express-validator')
-
 // Init settings before running the other classes
 settings.init({
   appName: 'Rpanion-server', // required,
   reverseDNS: 'com.server.rpanion', // required for macOS
-  filename: path.join(appRoot.toString(), 'settings.json')
+  filename: logpaths.settingsFile
 })
 
-const vManager = new videoStream(settings, winston)
-const fcManager = new fcManagerClass(settings, winston)
-const logManager = new flightLogger(winston)
-const ntripClient = new ntrip(settings, winston)
+const vManager = new videoStream(settings)
+const fcManager = new fcManagerClass(settings)
+const logManager = new flightLogger()
+const ntripClient = new ntrip(settings, )
 const cloud = new cloudManager(settings)
 const logConversion = new logConversionManager(settings)
-const adhocManager = new Adhoc(settings, winston)
+const adhocManager = new Adhoc(settings)
+const userMgmt = new userLogin()
+const pppConnectionManager = new pppConnection(settings)
 
-// cleanup, if needed
-process.on('SIGINT', quitting) // run signal handler when main process exits
-// process.on('SIGTERM', quitting) // run signal handler when service exits. Need for Ubuntu??
-
-function quitting () {
+// Add graceful shutdown handlers
+process.on('SIGINT', () => {
+  console.log('Received SIGINT. Shutting down gracefully...')
+  pppConnectionManager.quitting()
   cloud.quitting()
   logConversion.quitting()
   console.log('---Shutdown Rpanion---')
-  winston.info('---Shutdown Rpanion---')
   process.exit(0)
-}
+})
+
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM. Shutting down gracefully...')
+  pppConnectionManager.quitting()
+  cloud.quitting()
+  logConversion.quitting()
+  console.log('---Shutdown Rpanion---')
+  process.exit(0)
+})
+
+// Also good to handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err)
+  pppConnectionManager.quitting()
+  cloud.quitting()
+  logConversion.quitting()
+  console.log('---Shutdown Rpanion---')
+  process.exit(1)
+})
+
+// Handle nodemon restarts
+process.once('SIGUSR2', () => {
+  console.log('Received SIGUSR2. Shutting down gracefully...')
+  pppConnectionManager.quitting()
+  cloud.quitting()
+  logConversion.quitting()
+  console.log('---Shutdown Rpanion---')
+  process.kill(process.pid, 'SIGUSR2')
+})
 
 // Got an RTCM message, send to flight controller
 ntripClient.eventEmitter.on('rtcmpacket', (msg, seq) => {
@@ -151,8 +190,224 @@ app.use(bodyParser.json())
 // Serve the static files from the React app
 app.use(express.static(path.join(__dirname, '..', '/build')))
 
+// User login
+app.post('/api/login', [check('username').escape().isLength({ min: 2, max:20 }), check('password').escape().isLength({ min: 2, max:20 })], async (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    console.log('Bad POST vars in /api/login', { message: JSON.stringify(errors.array()) })
+    return res.status(422).json({ error: JSON.stringify(errors.array()) })
+  }
+  // Capture the input fields
+  let username = req.body.username
+  let password = req.body.password
+
+  userMgmt.checkLoginDetails(username, password).then((match) => {
+    if (match) {
+      // Generate a token with user information
+      const token = jwt.sign({ username: username }, RPANION_SECRET_KEY, {
+        expiresIn: '1h', // Token expires in 1 hour
+      })
+      res.send({
+        token: token
+      })
+    } else {
+      res.status(401).send(JSON.stringify({error: 'Invalid username or password'}))
+    }
+  })
+})
+
+// List all users
+app.get('/api/users', authenticateToken, (req, res) => {
+  userMgmt.getAllUsers().then((users) => {
+    res.send(JSON.stringify({users: users}))
+  })
+})
+
+// Update existing user password
+app.post('/api/updateUserPassword', authenticateToken, [check('username').escape().isLength({ min: 2, max:20 }), check('password').escape().isLength({ min: 2, max:20 })], async (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    console.log('Bad POST vars in /api/updateUserPassword', { message: JSON.stringify(errors.array()) })
+    return res.status(422).json({ error: JSON.stringify(errors.array()) })
+  }
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    //return res.status(400).send({
+    //  error: 'Username and password are required'
+    //})
+    res.status(400).send(JSON.stringify({error: 'Username and password are required'}))
+  }
+
+  userMgmt.changePassword(username, password).then((success) => {
+    if (success) {
+      res.send(JSON.stringify({infoMessage: 'User password updated successfully'}))
+    } else {
+      res.status(500).send(JSON.stringify({error: 'Error updating user password'}))
+    }
+  })
+})
+
+// Create new user
+app.post('/api/createUser', authenticateToken, [check('username').escape().isLength({ min: 2, max:20 }), check('password').escape().isLength({ min: 2, max:20 })], async (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    console.log('Bad POST vars in /api/logout', { message: JSON.stringify(errors.array()) })
+    return res.status(422).json({ error: JSON.stringify(errors.array()) })
+  }
+  const { username, password } = req.body
+
+  if (!username || !password) {
+    return res.status(400).send(JSON.stringify({error: 'Username and password are required'}))
+  }
+
+  userMgmt.addUser(username, password).then((success) => {
+    if (success) {
+      res.send(JSON.stringify({infoMessage: 'User created successfully'}))
+    } else {
+      res.status(500).send(JSON.stringify({error: 'Error creating user'}))
+    }
+  })
+})
+
+// Delete a user
+app.post('/api/deleteUser', authenticateToken, [check('username').escape().isLength({ min: 2, max:20 })], (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    console.log('Bad POST vars in /api/logout', { message: JSON.stringify(errors.array()) })
+    return res.status(422).json({ error: JSON.stringify(errors.array()) })
+  }
+  const { username } = req.body
+
+  if (!username) {
+    return res.status(400).send(JSON.stringify({error: 'Username is required'}))
+  }
+
+  userMgmt.deleteUser(username).then((success) => {
+    if (success) {
+      res.send(JSON.stringify({infoMessage: 'User deleted successfully'}))
+    } else {
+      res.status(500).send(JSON.stringify({error: 'Error deleting user'}))
+    }
+  })
+})
+
+// User logout
+app.post('/api/logout', authenticateToken, async (req, res) => {
+  const authHeader = req.headers['authorization']
+  const token = authHeader && authHeader.split(' ')[1]
+
+  // Add token to the blacklist
+  tokenBlacklist.push(token)
+
+  res.send({
+    token: token
+  })
+})
+
+// Simple token authentication call
+app.post('/api/auth', authenticateToken, async (req, res) => {
+  res.setHeader('Content-Type', 'application/json')
+  res.send(JSON.stringify({error: null}))
+})
+
+// Middleware to check if the request has a valid token
+function authenticateToken(req, res, next) {
+  let authHeader = null
+  let token = null
+  // Skip authentication in development mode
+  if (process.env.NODE_ENV === 'development') {
+    return next();
+  }
+  try {
+    authHeader = req.headers['authorization']
+    token = authHeader && authHeader.split(' ')[1]
+  } catch (err) {
+    return res.status(401).json({ message: 'Access denied. No token provided.' })
+  }
+
+  if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' })
+
+  // Check if the token is blacklisted
+  if (tokenBlacklist.includes(token)) {
+    return res.status(401).json({ message: 'Invalid token' })
+  }
+
+  jwt.verify(token, RPANION_SECRET_KEY, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid token' })
+    req.user = user // Attach user to request
+    next()
+  })
+}
+
+//pppConnectionManager url endpoints
+app.get('/api/pppconfig', authenticateToken, (req, res) => {
+  res.setHeader('Content-Type', 'application/json')
+  pppConnectionManager.getPPPSettings((err, settings) => {  
+    if (err) {
+      console.log('Error in /api/pppconfig', { message: err })
+      res.send(JSON.stringify({ error: err }))
+      return
+    }
+    res.send(JSON.stringify(settings))
+  })
+})
+
+app.post('/api/pppmodify', authenticateToken, [
+  check('device').isJSON(),
+  check('baudrate').isJSON(), 
+  check('localIP').isIP(),
+  check('remoteIP').isIP(),
+  check('enabled').isBoolean()
+], (req, res) => {
+  const errors = validationResult(req)
+  if (!errors.isEmpty()) {
+    console.log('Bad POST vars in /api/pppmodify', { message: JSON.stringify(errors.array()) })
+    return res.status(422).json({ error: JSON.stringify(errors.array()) })
+  }
+
+  if (req.body.enabled === true) {
+    console.log('Starting PPP connection');
+    res.setHeader('Content-Type', 'application/json')
+    pppConnectionManager.startPPP(JSON.parse(req.body.device), JSON.parse(req.body.baudrate), req.body.localIP, req.body.remoteIP, (err, settings) => {
+      if (err !== null) {
+        console.log('Error in /api/pppmodify', { message: err })
+        console.log(JSON.stringify({settings, error: err }))
+        res.send(JSON.stringify({settings, error: err.toString() }))
+        return
+      } else {
+        res.send(JSON.stringify({settings}))
+        return
+      }
+    })
+  }
+  else if (req.body.enabled === false) {
+    pppConnectionManager.stopPPP((err, settings) => {
+      if (err) {
+        //console.log('Error in /api/pppmodify', { message: err })
+        console.log(JSON.stringify({settings, error: err }))
+        res.send(JSON.stringify({settings, error: err }))
+        return
+      } else {
+        res.send(JSON.stringify({settings}))
+        return
+      }
+    })
+  }
+})
+
+// Serve the logfile
+app.get('/api/logfile', authenticateToken, (req, res) => {
+  aboutPage.getsystemctllog((logStr) => {
+    console.log(logStr)
+    res.setHeader('Content-Disposition', 'attachment; filename="rpanion.log"')
+    res.setHeader('Content-Type', 'text/plain')
+    res.send(logStr)
+  })
+})
+
 // Serve the vpn zerotier info
-app.get('/api/vpnzerotier', (req, res) => {
+app.get('/api/vpnzerotier', authenticateToken, (req, res) => {
   VPNManager.getVPNStatusZerotier(null, (stderr, statusJSON) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(JSON.stringify({ error: stderr, statusZerotier: statusJSON }))
@@ -160,10 +415,10 @@ app.get('/api/vpnzerotier', (req, res) => {
 })
 
 // Add zerotier network
-app.post('/api/vpnzerotieradd', [check('network').isAlphanumeric()], (req, res) => {
+app.post('/api/vpnzerotieradd', authenticateToken, [check('network').isAlphanumeric()], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/vpnzerotieradd', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/vpnzerotieradd', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
   VPNManager.addZerotier(req.body.network, (stderr, statusJSON) => {
@@ -173,10 +428,10 @@ app.post('/api/vpnzerotieradd', [check('network').isAlphanumeric()], (req, res) 
 })
 
 // Remove zerotier network
-app.post('/api/vpnzerotierdel', [check('network').isAlphanumeric()], (req, res) => {
+app.post('/api/vpnzerotierdel', authenticateToken, [check('network').isAlphanumeric()], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/vpnzerotierdel', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/vpnzerotierdel', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
   VPNManager.removeZerotier(req.body.network, (stderr, statusJSON) => {
@@ -186,7 +441,7 @@ app.post('/api/vpnzerotierdel', [check('network').isAlphanumeric()], (req, res) 
 })
 
 // Serve the vpn wireguard info
-app.get('/api/vpnwireguard', (req, res) => {
+app.get('/api/vpnwireguard', authenticateToken, (req, res) => {
   VPNManager.getVPNStatusWireguard(null, (stderr, statusJSON) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(JSON.stringify({ error: stderr, statusWireguard: statusJSON }))
@@ -194,22 +449,33 @@ app.get('/api/vpnwireguard', (req, res) => {
 })
 
 // Add new wireguard network
-app.post('/api/vpnwireguardprofileadd', (req, res) => {
+app.post('/api/vpnwireguardprofileadd', authenticateToken, (req, res) => {
   if (!req.files || Object.keys(req.files).length === 0 || req.files.wgprofile.truncated) {
     console.log("Couldn't upload")
-    return res.redirect('../vpn')
+    res.setHeader('Content-Type', 'application/json')
+    res.send(JSON.stringify({ error: 'Bad wireguard profile' }))
   }
 
-  VPNManager.addWireguardProfile(req.files.wgprofile.name, req.files.wgprofile.tempFilePath, () => {
-    return res.redirect('../vpn')
+  VPNManager.addWireguardProfile(req.files.wgprofile.name, req.files.wgprofile.tempFilePath, (err) => {
+    if (err) {
+      console.log('Error in /api/vpnwireguardprofileadd', { message: err })
+      res.setHeader('Content-Type', 'application/json')
+      res.send(JSON.stringify({ error: err }))
+    } else {
+      // get refreshed status
+      VPNManager.getVPNStatusWireguard(null, (stderr, statusJSON) => {
+        res.setHeader('Content-Type', 'application/json')
+        res.send(JSON.stringify({ error: stderr, statusWireguard: statusJSON }))
+      })
+    }
   })
 })
 
 // Activate wireguard network
-app.post('/api/vpnwireguardactivate', [check('network').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim()], (req, res) => {
+app.post('/api/vpnwireguardactivate', authenticateToken, [check('network').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim()], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/vpnwireguardactivate', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/vpnwireguardactivate', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
@@ -220,10 +486,10 @@ app.post('/api/vpnwireguardactivate', [check('network').not().isEmpty().not().co
 })
 
 // Deactivate wireguard network
-app.post('/api/vpnwireguarddeactivate', [check('network').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim()], (req, res) => {
+app.post('/api/vpnwireguarddeactivate', authenticateToken, [check('network').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim()], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/vpnwireguarddeactivate', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/vpnwireguarddeactivate', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
@@ -234,10 +500,10 @@ app.post('/api/vpnwireguarddeactivate', [check('network').not().isEmpty().not().
 })
 
 // Delete wireguard network
-app.post('/api/vpnwireguardelete', [check('network').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim()], (req, res) => {
+app.post('/api/vpnwireguardelete', authenticateToken, [check('network').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim()], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/vpnwireguardelete', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/vpnwireguardelete', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
@@ -248,16 +514,16 @@ app.post('/api/vpnwireguardelete', [check('network').not().isEmpty().not().conta
 })
 
 // Serve the ntrip info
-app.get('/api/ntripconfig', (req, res) => {
-  ntripClient.getSettings((host, port, mountpoint, username, password, active) => {
+app.get('/api/ntripconfig', authenticateToken, (req, res) => {
+  ntripClient.getSettings((host, port, mountpoint, username, password, active, useTLS) => {
     res.setHeader('Content-Type', 'application/json')
     // console.log(JSON.stringify({host: host,  port: port, mountpoint: mountpoint, username: username, password: password}))
-    res.send(JSON.stringify({ host, port, mountpoint, username, password, active }))
+    res.send({ host, port, mountpoint, username, password, active, useTLS })
   })
 })
 
 // Serve the cloud info
-app.get('/api/cloudinfo', (req, res) => {
+app.get('/api/cloudinfo', authenticateToken, (req, res) => {
   cloud.getSettings((doBinUpload, binUploadLink, syncDeletions, pubkey) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(JSON.stringify({ doBinUpload, binUploadLink, syncDeletions, pubkey }))
@@ -265,13 +531,13 @@ app.get('/api/cloudinfo', (req, res) => {
 })
 
 // activate or deactivate bin log upload
-app.post('/api/binlogupload', [check('doBinUpload').isBoolean(),
+app.post('/api/binlogupload', authenticateToken, [check('doBinUpload').isBoolean(),
   check('binUploadLink').not().isEmpty().not().contains(';').not().contains('\'').not().contains('"').trim(),
   check('syncDeletions').isBoolean()], function (req, res) {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     console.log(req.body)
-    winston.error('Bad POST vars in /api/binlogupload', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/binlogupload', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   } else {
     cloud.setSettingsBin(req.body.doBinUpload, req.body.binUploadLink, req.body.syncDeletions)
@@ -284,7 +550,7 @@ app.post('/api/binlogupload', [check('doBinUpload').isBoolean(),
 })
 
 // Serve the logconversion info
-app.get('/api/logconversioninfo', (req, res) => {
+app.get('/api/logconversioninfo', authenticateToken, (req, res) => {
   logConversion.getSettings((doLogConversion) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(JSON.stringify({ doLogConversion }))
@@ -292,12 +558,12 @@ app.get('/api/logconversioninfo', (req, res) => {
 })
 
 // activate or deactivate logconversion
-app.post('/api/logconversion', [check('doLogConversion').isBoolean()
+app.post('/api/logconversion', authenticateToken, [check('doLogConversion').isBoolean()
 ], function (req, res) {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     console.log(req.body)
-    winston.error('Bad POST vars in /api/logconversion', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/logconversion', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   } else {
     logConversion.setSettingsLog(req.body.doLogConversion)
@@ -310,7 +576,7 @@ app.post('/api/logconversion', [check('doLogConversion').isBoolean()
 })
 
 // Serve the adhocwifi info
-app.get('/api/adhocadapters', (req, res) => {
+app.get('/api/adhocadapters', authenticateToken, (req, res) => {
   adhocManager.getAdapters((err, netDeviceList, netDeviceSelected, settings) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -320,13 +586,13 @@ app.get('/api/adhocadapters', (req, res) => {
       res.setHeader('Content-Type', 'application/json')
       const ret = { netDevice: [], netDeviceSelected: [], cursettings: [], error: err }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/adhocadapters ', { message: err })
+      console.log('Error in /api/adhocadapters ', { message: err })
     }
   })
 })
 
 // activate or deactivate adhoc wifi
-app.post('/api/adhocadaptermodify', [check('settings.isActive').isBoolean(),
+app.post('/api/adhocadaptermodify', authenticateToken, [check('settings.isActive').isBoolean(),
   check('toState').isBoolean(),
   check('netDeviceSelected').isAlphanumeric(),
   check('settings.ipaddress').if(check('toState').isIn([true])).isIP(),
@@ -339,7 +605,7 @@ app.post('/api/adhocadaptermodify', [check('settings.isActive').isBoolean(),
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     console.log(req.body)
-    winston.error('Bad POST vars in /api/adhocadaptermodify', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/adhocadaptermodify', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   } else {
     adhocManager.setAdapter(req.body.toState, req.body.netDeviceSelected, req.body.settings, (err, netDeviceList, netDeviceSelected, settings) => {
@@ -351,36 +617,38 @@ app.post('/api/adhocadaptermodify', [check('settings.isActive').isBoolean(),
         res.setHeader('Content-Type', 'application/json')
         const ret = { netDevice: netDeviceList, netDeviceSelected, curSettings: settings, error: err }
         res.send(JSON.stringify(ret))
-        winston.error('Error in /api/adhocadapters ', { message: err })
+        console.log('Error in /api/adhocadapters ', { message: err })
       }
     })
   }
 })
 
 // change ntrip settings
-app.post('/api/ntripmodify', [check('active').isBoolean(),
+app.post('/api/ntripmodify', authenticateToken, [check('active').isBoolean(),
   check('host').isLength({ min: 5 }),
   check('port').isPort(),
   check('mountpoint').isLength({ min: 1 }),
   check('username').isLength({ min: 5 }),
-  check('password').isLength({ min: 5 })], function (req, res) {
+  check('password').isLength({ min: 5 }),
+  check('useTLS').isBoolean()], function (req, res) {
   // User wants to start/stop NTRIP
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/ntripmodify', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/ntripmodify', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
-  ntripClient.setSettings(JSON.parse(req.body.host), req.body.port, JSON.parse(req.body.mountpoint), JSON.parse(req.body.username), JSON.parse(req.body.password), req.body.active)
-  ntripClient.getSettings((host, port, mountpoint, username, password, active) => {
+  ntripClient.setSettings(JSON.parse(req.body.host), req.body.port, JSON.parse(req.body.mountpoint), JSON.parse(req.body.username),
+                          JSON.parse(req.body.password), req.body.active, req.body.useTLS)
+  ntripClient.getSettings((host, port, mountpoint, username, password, active, useTLS) => {
     res.setHeader('Content-Type', 'application/json')
     // console.log(JSON.stringify({host: host,  port: port, mountpoint: mountpoint, username: username, password: password}))
-    res.send(JSON.stringify({ host, port, mountpoint, username, password, active }))
+    res.send(JSON.stringify({ host, port, mountpoint, username, password, active, useTLS }))
   })
 })
 
 // Serve the AP clients info
-app.get('/api/networkclients', (req, res) => {
+app.get('/api/networkclients', authenticateToken, (req, res) => {
   networkClients.getClients((err, apnamev, apclientsv) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(JSON.stringify({ error: err, apname: apnamev, apclients: apclientsv }))
@@ -388,22 +656,19 @@ app.get('/api/networkclients', (req, res) => {
 })
 
 // Serve the logfiles
-app.use('/logdownload', express.static(path.join(__dirname, '..', '/flightlogs')))
+app.use('/logdownload', express.static(logpaths.flightsLogsDir))
 
-// Serve the logfiles
-app.use('/rplogs', express.static(path.join(__dirname, '..', '/logs')))
-
-app.get('/api/logfiles', (req, res) => {
+app.get('/api/logfiles', authenticateToken, (req, res) => {
   logManager.getLogs((err, tlogs, binlogs, kmzlogs) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(JSON.stringify({ TlogFiles: tlogs, BinlogFiles: binlogs, KMZlogFiles: kmzlogs, url: req.protocol + '://' + req.headers.host }))
   })
 })
 
-app.post('/api/deletelogfiles', [check('logtype').isIn(['tlog', 'binlog', 'kmzlog'])], (req, res) => {
+app.post('/api/deletelogfiles', authenticateToken, [check('logtype').isIn(['tlog', 'binlog', 'kmzlog'])], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/deletelogfiles', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/deletelogfiles', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
@@ -412,23 +677,25 @@ app.post('/api/deletelogfiles', [check('logtype').isIn(['tlog', 'binlog', 'kmzlo
   res.send(JSON.stringify({}))
 })
 
-app.get('/api/softwareinfo', (req, res) => {
+app.get('/api/softwareinfo', authenticateToken, (req, res) => {
   aboutPage.getSoftwareInfo((OSV, NodeV, RpanionV, hostname, err) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({ OSVersion: OSV, Nodejsversion: NodeV, rpanionversion: RpanionV, hostname }))
-      winston.info('/api/softwareinfo OS:' + OSV + ' Node:' + NodeV + ' Rpanion:' + RpanionV + ' Hostname: ' + hostname)
+      console.log('/api/softwareinfo OS:' + OSV + ' Node:' + NodeV + ' Rpanion:' + RpanionV + ' Hostname: ' + hostname)
     } else {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({ OSVersion: err, Nodejsversion: err, rpanionversion: err, hostname: err }))
-      winston.error('Error in /api/softwareinfo ', { message: err })
+      console.log('Error in /api/softwareinfo ', { message: err })
     }
   })
 })
 
-app.get('/api/videodevices', (req, res) => {
+app.get('/api/videodevices', authenticateToken, (req, res) => {
   vManager.populateAddresses()
-  vManager.getVideoDevices((err, devices, active, seldevice, selRes, selRot, selbitrate, selfps, SeluseUDP, SeluseUDPIP, SeluseUDPPort, timestamp, fps, FPSMax, vidres, useCameraHeartbeat, selMavURI) => {
+  vManager.getVideoDevices((err, devices, active, seldevice, selRes, selRot, selbitrate,
+                            selfps, SeluseUDPIP, SeluseUDPPort, timestamp,
+                            fps, FPSMax, vidres, useCameraHeartbeat, selMavURI, compression, Seltransport, transportOptions) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({
@@ -442,7 +709,8 @@ app.get('/api/videodevices', (req, res) => {
         rotSelected: selRot,
         bitrate: selbitrate,
         fpsSelected: selfps,
-        UDPChecked: SeluseUDP,
+        transportSelected: Seltransport,
+        transportOptions: transportOptions,
         useUDPIP: SeluseUDPIP,
         useUDPPort: SeluseUDPPort,
         timestamp,
@@ -450,17 +718,18 @@ app.get('/api/videodevices', (req, res) => {
         fps: fps,
         FPSMax: FPSMax,
         enableCameraHeartbeat: useCameraHeartbeat,
-        mavStreamSelected: selMavURI
+        mavStreamSelected: selMavURI,
+        compression: compression
       }))
     } else {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({ error: err }))
-      winston.error('Error in /api/videodevices ', { message: err })
+      console.log('Error in /api/videodevices ', { message: err })
     }
   })
 })
 
-app.get('/api/hardwareinfo', (req, res) => {
+app.get('/api/hardwareinfo', authenticateToken, (req, res) => {
   aboutPage.getHardwareInfo((RAM, CPU, hatData, sysData, err) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -468,12 +737,12 @@ app.get('/api/hardwareinfo', (req, res) => {
     } else {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({ CPUName: err, RAMName: err, HATName: err, SYSName: err }))
-      winston.error('Error in /api/hardwareinfo ', { message: err })
+      console.log('Error in /api/hardwareinfo ', { message: err })
     }
   })
 })
 
-app.get('/api/diskinfo', (req, res) => {
+app.get('/api/diskinfo', authenticateToken, (req, res) => {
   aboutPage.getDiskInfo((total, used, percent, err) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -481,19 +750,21 @@ app.get('/api/diskinfo', (req, res) => {
     } else {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({ diskSpaceStatus: err }))
-      winston.error('Error in /api/diskinfo ', { message: err })
+      console.log('Error in /api/diskinfo ', { message: err })
     }
   })
 })
 
-app.get('/api/FCOutputs', (req, res) => {
+app.get('/api/FCOutputs', authenticateToken, (req, res) => {
   res.setHeader('Content-Type', 'application/json')
   res.send(JSON.stringify({ UDPoutputs: fcManager.getUDPOutputs() }))
 })
 
-app.get('/api/FCDetails', (req, res) => {
+app.get('/api/FCDetails', authenticateToken, (req, res) => {
   res.setHeader('Content-Type', 'application/json')
-  fcManager.getSerialDevices((err, devices, bauds, seldevice, selbaud, mavers, selmav, active, enableHeartbeat, enableTCP, enableUDPB, UDPBPort, enableDSRequest, tlogging) => {
+  fcManager.getDeviceSettings((err, devices, bauds, seldevice, selbaud, mavers, selmav,
+    active, enableHeartbeat, enableTCP, enableUDPB, UDPBPort, enableDSRequest, tlogging,
+    udpInputPort, selInputType, inputTypes) => {
     // hacky way to pass through the
     if (!err) {
       console.log('Sending')
@@ -511,7 +782,10 @@ app.get('/api/FCDetails', (req, res) => {
         enableUDPB,
         UDPBPort,
         enableDSRequest,
-        tlogging
+        tlogging,
+        udpInputPort,
+        selInputType,
+        inputTypes
       }))
     } else {
       console.log(devices)
@@ -529,32 +803,32 @@ app.get('/api/FCDetails', (req, res) => {
         enableUDPB,
         UDPBPort,
         enableDSRequest,
-        tlogging
+        tlogging,
+        udpInputPort,
+        selInputType,
+        inputTypes
       }))
-      winston.error('Error in /api/FCDetails ', { message: err })
+      console.log('Error in /api/FCDetails ', { message: err })
     }
   })
 })
 
-app.post('/api/shutdowncc', function () {
+app.post('/api/shutdowncc', authenticateToken, function () {
   // User wants to shutdown the computer
   aboutPage.shutdownCC()
 })
 
-app.post('/api/updatemaster', function () {
-  // User wants to update Rpanion to latest master
-  aboutPage.updateRS(io)
-})
-
-app.post('/api/FCModify', [check('device').isJSON(), check('baud').isJSON(), check('mavversion').isJSON(), check('enableHeartbeat').isBoolean(), check('enableTCP').isBoolean(), check('enableUDPB').isBoolean(), check('UDPBPort').isPort(), check('enableDSRequest').isBoolean(), check('tlogging').isBoolean()], function (req, res) {
+app.post('/api/FCModify', authenticateToken, [check('device').isJSON(), check('baud').isJSON(), check('mavversion').isJSON(), check('enableHeartbeat').isBoolean(), check('enableTCP').isBoolean(), check('enableUDPB').isBoolean(), check('UDPBPort').isPort(), check('enableDSRequest').isBoolean(), check('tlogging').isBoolean()], function (req, res) {
   // User wants to start/stop FC telemetry
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/FCModify', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/FCModify', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
-  fcManager.startStopTelemetry(JSON.parse(req.body.device), JSON.parse(req.body.baud), JSON.parse(req.body.mavversion), req.body.enableHeartbeat, req.body.enableTCP, req.body.enableUDPB, req.body.UDPBPort, req.body.enableDSRequest, req.body.tlogging, (err, isSuccess) => {
+  fcManager.startStopTelemetry(JSON.parse(req.body.device), JSON.parse(req.body.baud), JSON.parse(req.body.mavversion), req.body.enableHeartbeat,
+                               req.body.enableTCP, req.body.enableUDPB, req.body.UDPBPort, req.body.enableDSRequest,
+                               req.body.tlogging, JSON.parse(req.body.inputType), req.body.udpInputPort, (err, isSuccess) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       // console.log(isSuccess);
@@ -562,19 +836,19 @@ app.post('/api/FCModify', [check('device').isJSON(), check('baud').isJSON(), che
     } else {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({ telemetryStatus: false, error: err }))
-      winston.error('Error in /api/FCModify ', { message: err })
+      console.log('Error in /api/FCModify ', { message: err })
     }
   })
 })
 
-app.post('/api/FCReboot', function () {
+app.post('/api/FCReboot', authenticateToken, function () {
   fcManager.rebootFC()
 })
 
-app.post('/api/addudpoutput', [check('newoutputIP').isIP(), check('newoutputPort').isInt({ min: 1 })], function (req, res) {
+app.post('/api/addudpoutput', authenticateToken, [check('newoutputIP').isIP(), check('newoutputPort').isInt({ min: 1 })], function (req, res) {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/addudpoutput ', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/addudpoutput ', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
@@ -584,10 +858,10 @@ app.post('/api/addudpoutput', [check('newoutputIP').isIP(), check('newoutputPort
   res.send(JSON.stringify({ UDPoutputs: newOutput }))
 })
 
-app.post('/api/removeudpoutput', [check('removeoutputIP').isIP(), check('removeoutputPort').isInt({ min: 1 })], function (req, res) {
+app.post('/api/removeudpoutput', authenticateToken, [check('removeoutputIP').isIP(), check('removeoutputPort').isInt({ min: 1 })], function (req, res) {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/removeudpoutput ', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/removeudpoutput ', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
@@ -595,6 +869,15 @@ app.post('/api/removeudpoutput', [check('removeoutputIP').isIP(), check('removeo
 
   res.setHeader('Content-Type', 'application/json')
   res.send(JSON.stringify({ UDPoutputs: newOutput }))
+})
+
+io.engine.use((req, res, next) => {
+  const isHandshake = req._query.sid === undefined
+  if (isHandshake) {
+    authenticateToken(req, res, next)
+  } else {
+    next()
+  }
 })
 
 io.on('connection', function () {
@@ -608,10 +891,11 @@ io.on('connection', function () {
     io.sockets.emit('NTRIPStatus', ntripClient.conStatusStr())
     io.sockets.emit('CloudBinStatus', cloud.conStatusBinStr())
     io.sockets.emit('LogConversionStatus', logConversion.conStatusLogStr())
+    io.sockets.emit('PPPStatus', pppConnectionManager.conStatusStr())
   }, 1000)
 })
 
-app.get('/api/networkadapters', (req, res) => {
+app.get('/api/networkadapters', authenticateToken, (req, res) => {
   networkManager.getAdapters((err, netDeviceList) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -621,12 +905,12 @@ app.get('/api/networkadapters', (req, res) => {
       res.setHeader('Content-Type', 'application/json')
       const ret = { netDevice: [] }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/networkadapters ', { message: err })
+      console.log('Error in /api/networkadapters ', { message: err })
     }
   })
 })
 
-app.get('/api/wifiscan', (req, res) => {
+app.get('/api/wifiscan', authenticateToken, (req, res) => {
   networkManager.getWifiScan((err, wifiList) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -636,12 +920,12 @@ app.get('/api/wifiscan', (req, res) => {
       res.setHeader('Content-Type', 'application/json')
       const ret = { detWifi: [] }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/wifiscan ', { message: err })
+      console.log('Error in /api/wifiscan ', { message: err })
     }
   })
 })
 
-app.get('/api/wirelessstatus', (req, res) => {
+app.get('/api/wirelessstatus', authenticateToken, (req, res) => {
   networkManager.getWirelessStatus((err, status) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -651,15 +935,15 @@ app.get('/api/wirelessstatus', (req, res) => {
       res.setHeader('Content-Type', 'application/json')
       const ret = { wirelessEnabled: true }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/wirelessstatus ', { message: err })
+      console.log('Error in /api/wirelessstatus ', { message: err })
     }
   })
 })
 
-app.post('/api/setwirelessstatus', [check('status').isBoolean()], (req, res) => {
+app.post('/api/setwirelessstatus', authenticateToken, [check('status').isBoolean()], (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/setwirelessstatus ', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/setwirelessstatus ', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
   // user wants to toggle wifi enabled/disabled
@@ -672,12 +956,12 @@ app.post('/api/setwirelessstatus', [check('status').isBoolean()], (req, res) => 
       res.setHeader('Content-Type', 'application/json')
       const ret = { wirelessEnabled: status }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/setwirelessstatus ', { message: err })
+      console.log('Error in /api/setwirelessstatus ', { message: err })
     }
   })
 })
 
-app.get('/api/networkconnections', (req, res) => {
+app.get('/api/networkconnections', authenticateToken, (req, res) => {
   networkManager.getConnections((err, netConnectionList) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
@@ -687,16 +971,16 @@ app.get('/api/networkconnections', (req, res) => {
       res.setHeader('Content-Type', 'application/json')
       const ret = { netConnection: [] }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/networkconnections ', { message: err })
+      console.log('Error in /api/networkconnections ', { message: err })
     }
   })
 })
 
-app.post('/api/startstopvideo', [check('active').isBoolean(),
+app.post('/api/startstopvideo', authenticateToken, [check('active').isBoolean(),
   check('device').if(check('active').isIn([true])).isLength({ min: 2 }),
   check('height').if(check('active').isIn([true])).isInt({ min: 1 }),
   check('width').if(check('active').isIn([true])).isInt({ min: 1 }),
-  check('useUDP').if(check('active').isIn([true])).isBoolean(),
+  check('transport').if(check('active').isIn([true])).isIn(['RTP', 'RTSP']),
   check('useTimestamp').if(check('active').isIn([true])).isBoolean(),
   check('useCameraHeartbeat').if(check('active').isIn([true])).isBoolean(),
   check('useUDPPort').if(check('active').isIn([true])).isPort(),
@@ -704,15 +988,18 @@ app.post('/api/startstopvideo', [check('active').isBoolean(),
   check('bitrate').if(check('active').isIn([true])).isInt({ min: 50, max: 50000 }),
   check('format').if(check('active').isIn([true])).isIn(['video/x-raw', 'video/x-h264', 'image/jpeg']),
   check('fps').if(check('active').isIn([true])).isInt({ min: -1, max: 100 }),
-  check('rotation').if(check('active').isIn([true])).isInt().isIn([0, 90, 180, 270])], (req, res) => {
+  check('rotation').if(check('active').isIn([true])).isInt().isIn([0, 90, 180, 270])],
+  check('compression').if(check('active').isIn([true])).isIn(['H264', 'H265']), (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/startstopvideo ', { message: errors.array() })
+    console.log('Bad POST vars in /api/startstopvideo ', { message: errors.array() })
     const ret = { streamingStatus: false, streamAddresses: [], error: ['Error ' + JSON.stringify(errors.array())] }
     return res.status(422).json(ret)
   }
   // user wants to start/stop video streaming
-  vManager.startStopStreaming(req.body.active, req.body.device, req.body.height, req.body.width, req.body.format, req.body.rotation, req.body.bitrate, req.body.fps, req.body.useUDP, req.body.useUDPIP, req.body.useUDPPort, req.body.useTimestamp, req.body.useCameraHeartbeat, req.body.mavStreamSelected, (err, status, addresses) => {
+  vManager.startStopStreaming(req.body.active, req.body.device, req.body.height, req.body.width, req.body.format, req.body.rotation,
+                              req.body.bitrate, req.body.fps, req.body.transport, req.body.useUDPIP, req.body.useUDPPort,
+                              req.body.useTimestamp, req.body.useCameraHeartbeat, req.body.mavStreamSelected, req.body.compression, (err, status, addresses) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       const ret = { streamingStatus: status, streamAddresses: addresses }
@@ -721,17 +1008,17 @@ app.post('/api/startstopvideo', [check('active').isBoolean(),
       res.setHeader('Content-Type', 'application/json')
       const ret = { streamingStatus: false, streamAddresses: ['Error ' + err] }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/startstopvideo ', { message: err })
+      console.log('Error in /api/startstopvideo ', { message: err })
     }
   })
 })
 
 // Get details of a network connection by connection ID
-app.post('/api/networkIP', [check('conName').isUUID()], (req, res) => {
+app.post('/api/networkIP', authenticateToken, [check('conName').isUUID()], (req, res) => {
   // Finds the validation errors in this request and wraps them in an object with handy functions
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    winston.error('Bad POST vars in /api/networkIP ', { message: JSON.stringify(errors.array()) })
+    console.log('Bad POST vars in /api/networkIP ', { message: JSON.stringify(errors.array()) })
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
   networkManager.getConnectionDetails(req.body.conName, (err, conDetails) => {
@@ -743,20 +1030,20 @@ app.post('/api/networkIP', [check('conName').isUUID()], (req, res) => {
       res.setHeader('Content-Type', 'application/json')
       const ret = { netConnectionDetails: {} }
       res.send(JSON.stringify(ret))
-      winston.error('Error in /api/networkIP ', { message: err })
+      console.log('Error in /api/networkIP ', { message: err })
     }
   })
 })
 
 // user wants to activate network
-app.post('/api/networkactivate', [check('conName').isUUID()], (req, res) => {
+app.post('/api/networkactivate', authenticateToken, [check('conName').isUUID()], (req, res) => {
   // Finds the validation errors in this request and wraps them in an object with handy functions
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     res.setHeader('Content-Type', 'application/json')
     const ret = { error: 'Bad input - ' + errors.array()[0].param }
     res.send(JSON.stringify(ret))
-    winston.error('Bad POST vars in /api/networkactivate ', { message: errors.array() })
+    console.log('Bad POST vars in /api/networkactivate ', { message: errors.array() })
   } else {
     console.log('Activating network ' + req.body.conName)
     networkManager.activateConnection(req.body.conName, (err) => {
@@ -764,7 +1051,7 @@ app.post('/api/networkactivate', [check('conName').isUUID()], (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: err }
         res.send(JSON.stringify(ret))
-        winston.error('Error in /api/networkactivate ', { message: err })
+        console.log('Error in /api/networkactivate ', { message: err })
       } else {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: null, action: 'NetworkActivateOK' }
@@ -775,14 +1062,14 @@ app.post('/api/networkactivate', [check('conName').isUUID()], (req, res) => {
 })
 
 // user wants to deactivate network
-app.post('/api/networkdeactivate', [check('conName').isUUID()], (req, res) => {
+app.post('/api/networkdeactivate', authenticateToken, [check('conName').isUUID()], (req, res) => {
   // Finds the validation errors in this request and wraps them in an object with handy functions
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     res.setHeader('Content-Type', 'application/json')
     const ret = { error: 'Bad input - ' + errors.array()[0].param }
     res.send(JSON.stringify(ret))
-    winston.error('Bad POST vars in /api/networkdeactivate ', { message: errors.array() })
+    console.log('Bad POST vars in /api/networkdeactivate ', { message: errors.array() })
   } else {
     console.log('Dectivating network ' + req.body.conName)
     networkManager.deactivateConnection(req.body.conName, (err) => {
@@ -790,7 +1077,7 @@ app.post('/api/networkdeactivate', [check('conName').isUUID()], (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: err }
         res.send(JSON.stringify(ret))
-        winston.error('Error in /api/networkdeactivate ', { message: err })
+        console.log('Error in /api/networkdeactivate ', { message: err })
       } else {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: null, action: 'NetworkDectivateOK' }
@@ -801,14 +1088,14 @@ app.post('/api/networkdeactivate', [check('conName').isUUID()], (req, res) => {
 })
 
 // user wants to delete network
-app.post('/api/networkdelete', [check('conName').isUUID()], (req, res) => {
+app.post('/api/networkdelete', authenticateToken, [check('conName').isUUID()], (req, res) => {
   // Finds the validation errors in this request and wraps them in an object with handy functions
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     res.setHeader('Content-Type', 'application/json')
     const ret = { error: 'Bad input - ' + errors.array()[0].param }
     res.send(JSON.stringify(ret))
-    winston.error('Bad POST vars in /api/networkdelete ', { message: errors.array() })
+    console.log('Bad POST vars in /api/networkdelete ', { message: errors.array() })
   } else {
     console.log('Deleting network ' + req.body.conName)
     networkManager.deleteConnection(req.body.conName, (err) => {
@@ -816,7 +1103,7 @@ app.post('/api/networkdelete', [check('conName').isUUID()], (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: err }
         res.send(JSON.stringify(ret))
-        winston.error('Error in /api/networkdelete ', { message: err })
+        console.log('Error in /api/networkdelete ', { message: err })
       } else {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: null, action: 'NetworkDeleteOK' }
@@ -827,7 +1114,7 @@ app.post('/api/networkdelete', [check('conName').isUUID()], (req, res) => {
 })
 
 // user wants to edit network
-app.post('/api/networkedit', [check('conName').isUUID(),
+app.post('/api/networkedit', authenticateToken, [check('conName').isUUID(),
   check('conSettings.ipaddresstype.value').isIn(['auto', 'manual', 'shared']),
   check('conSettings.ipaddress.value').optional().isIP(),
   check('conSettings.subnet.value').optional().isIP(),
@@ -846,7 +1133,7 @@ app.post('/api/networkedit', [check('conName').isUUID(),
     res.setHeader('Content-Type', 'application/json')
     const ret = { error: 'Bad input - ' + errors.array()[0].param }
     res.send(JSON.stringify(ret))
-    winston.error('Bad POST vars in /api/networkedit ', { message: errors.array() })
+    console.log('Bad POST vars in /api/networkedit ', { message: errors.array() })
   } else {
     console.log('Editing network ' + req.body.conName)
     networkManager.editConnection(req.body.conName, req.body.conSettings, (err) => {
@@ -854,7 +1141,7 @@ app.post('/api/networkedit', [check('conName').isUUID(),
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: err }
         res.send(JSON.stringify(ret))
-        winston.error('Error in /api/networkedit ', { message: err })
+        console.log('Error in /api/networkedit ', { message: err })
       } else {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: null, action: 'NetworkEditOK' }
@@ -865,7 +1152,7 @@ app.post('/api/networkedit', [check('conName').isUUID(),
 })
 
 // User wants to add network
-app.post('/api/networkadd', [check('conSettings.ipaddresstype.value').isIn(['auto', 'manual', 'shared']),
+app.post('/api/networkadd', authenticateToken, [check('conSettings.ipaddresstype.value').isIn(['auto', 'manual', 'shared']),
   check('conSettings.ipaddress.value').optional().isIP(),
   check('conSettings.subnet.value').optional().isIP(),
   check('conSettings.wpaType.value').optional().isIn(['none', 'wpa-psk']),
@@ -886,7 +1173,7 @@ app.post('/api/networkadd', [check('conSettings.ipaddresstype.value').isIn(['aut
     res.setHeader('Content-Type', 'application/json')
     const ret = { error: 'Bad input - ' + errors.array()[0].param }
     res.send(JSON.stringify(ret))
-    winston.error('Bad POST vars in /api/networkadd ', { message: errors.array() })
+    console.log('Bad POST vars in /api/networkadd ', { message: errors.array() })
   } else {
     console.log('Adding network ' + req.body)
     networkManager.addConnection(req.body.conName, req.body.conType, req.body.conAdapter, req.body.conSettings, (err) => {
@@ -894,7 +1181,7 @@ app.post('/api/networkadd', [check('conSettings.ipaddresstype.value').isIn(['aut
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: err }
         res.send(JSON.stringify(ret))
-        winston.error('Error in /api/networkadd ', { message: err })
+        console.log('Error in /api/networkadd ', { message: err })
       } else {
         res.setHeader('Content-Type', 'application/json')
         const ret = { error: null, action: 'NetworkAddOK' }
@@ -905,16 +1192,23 @@ app.post('/api/networkadd', [check('conSettings.ipaddresstype.value').isIn(['aut
   console.log(req.body)
 })
 
-// Handles any requests that don't match the ones above (ie pass to react app)
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '..', '/build/index.html'))
-})
+// Pass GUI requests to the React app only in production mode
+if (process.env.NODE_ENV !== 'development')
+{
+  app.get(['/', '/controller', '/about', '/network',
+          '/video', '/vpn', '/ntrip', '/cloud', '/flightlogs',
+          '/apclients', '/adhoc', '/logoutconfirm', '/users', '/ppp'], (req, res) => {
+    res.sendFile(path.join(__dirname, '..', '/build/index.html'))
+  })
+}
 
-const port = process.env.PORT || 3001
-http.listen(port, () => {
-  console.log('Express server is running on localhost:' + port)
-  winston.info('Express server is running on localhost:' + port)
-})
+module.exports = app;
 
-// Export the app instance for testing purposes
-module.exports = app
+// Only start the server if this file is being run directly (not imported)
+if (require.main === module) {
+  const port = process.env.PORT || 3001;
+  http.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+

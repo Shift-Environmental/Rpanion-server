@@ -1,5 +1,31 @@
 ### Changelog
 
+#### [v0.11.1](https://github.com/stephendade/Rpanion-server/compare/v0.11.0...v0.11.1)
+ - Migrate to using debian packages for release
+ - Use specific "rpanion" user with proper permissions for networking and vpn management
+ - Use ``/etc/rpanion-server`` to store logs and user files when running from deb package
+ - Update to using vite package for frontend development
+ - Video: Add option to stream using H265 codec
+ - Ntrip: Add TLS support
+ - Video: Better detection of Ras Pi CSI camera resolutions
+
+#### [v0.11.0](https://github.com/stephendade/Rpanion-server/compare/v0.10.0...v0.11.0)
+ - Add support for Raspberry Pi 5
+ - Add support for NVIDIA Jetson Orin
+ - Add support for nodejs 22
+ - Flight Controller: Rpanion-server can send it's own MAVLink HEARTBEAT messages
+ - Add support for RasPiOS Bookworm
+ - Video: Better detection of Cameras
+ - Video: Add support for the Raspbery Pi GS Camera
+ - Video: Latency reductions
+ - Logging: Moved tlog handling to mavlink-router
+ - Video: More reliable detection (and usage) of hardware H264 encoding
+ - Video: Rpanion-server can send it's own MAVLink VIDEO_STREAM_INFORMATION messages
+ - Video: Basic implementation of MAVLink camera protocol
+ - Add username/password protection to Web GUI
+ - Network: Major bug fixes when adding and removing networks
+ - Various security fixes to Web GUI
+
 #### [v0.10.0](https://github.com/stephendade/Rpanion-server/compare/v0.9.0...v0.10.0)
  - Add support for nodejs 18 and 20
  - Video: Use libcamera on Raspberry Pi

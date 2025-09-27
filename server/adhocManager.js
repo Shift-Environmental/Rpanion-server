@@ -7,8 +7,7 @@ as nmcli does not support ad-hoc networks
 const { exec, execSync } = require('child_process')
 
 class adhocManager {
-  constructor (settings, winston) {
-    this.winston = winston
+  constructor (settings) {
     this.settings = settings
 
     this.devicesettings = this.settings.value('adhoc.devicesettings', null)
@@ -20,10 +19,8 @@ class adhocManager {
       this.setAdapter(true, this.device, this.devicesettings, (err) => {
         if (!err) {
           console.log('Adhoc Init ' + this.device.toString())
-          this.winston.info('Adhoc Init ' + this.device.toString())
         } else {
           console.log('Error in adhoc init ', { message: err })
-          this.winston.error('Error in adhoc init  ', { message: err })
         }
       })
     }
@@ -48,14 +45,12 @@ class adhocManager {
 
       if (stderr) {
         console.error(`exec error: ${error}`)
-        this.winston.error('Error in getAdapters() ', { message: stderr })
         return callback(stderr)
       } else {
         stdout.split('\n').forEach(function (item) {
           const device = item.split(':')
           if (device.length === 3 && device[1] === 'wifi' && device[2] !== 'unavailable') {
             console.log('Adding Network device ' + device[0])
-            // this.winston.info('getAdapters() adding ' + device)
             // if wifi, check for avail channels
             const freqList = []
             try {
@@ -74,7 +69,7 @@ class adhocManager {
               const outputcfg = execSync('iwconfig ' + device[0])
               const ipcfg = execSync('ip -4 -j addr show ' + device[0])
               const gateway = execSync('ip route show | grep ' + device[0] + ' | grep default | awk \'{ print $3 }\'')
-              const pwdLine = execSync('sudo iwlist ' + device[0] + ' key')
+              const pwdLine = execSync('iwlist ' + device[0] + ' key')
               if (outputcfg.toString().includes('Mode:Ad-Hoc')) {
                 // adapter is acive in adhoc mopde, grab settings
                 activeDevice = device[0]
@@ -115,7 +110,6 @@ class adhocManager {
               }
             } catch (e) {
               console.error('exec error: ' + e)
-              //this.winston.error('Error in getAdapters() ', { message: e })
               return callback(e)
             }
 
@@ -146,31 +140,28 @@ class adhocManager {
     if (toState) {
       // activate
       console.log('Activate Adhoc')
-      exec('nmcli dev set ' + device + ' managed no && sleep 1 && sudo ip link set ' +
-      device + ' down && sudo iwconfig ' +
-      device + ' mode ad-hoc ' + ' && sudo iwconfig ' +
-      device + ' channel ' + settings.channel + ' && sudo iwconfig ' +
+      exec('nmcli dev set ' + device + ' managed no && sleep 1 && ip link set ' +
+      device + ' down && iwconfig ' +
+      device + ' mode ad-hoc ' + ' && iwconfig ' +
+      device + ' channel ' + settings.channel + ' && iwconfig ' +
       device + ' essid \'' + settings.ssid + '\'  ' +
-      (settings.wpaType === 'none' ? '' : '&& sudo iwconfig ' + device + ' key s:' + settings.password) +
-      ' && sudo ip addr flush ' + device +
-      ' && sudo ip addr add ' + settings.ipaddress + '/16 dev ' + device +
-      ' && sudo ip link set ' + device + ' up' +
-      (settings.gateway === '' ? '' : '&& sudo route add default gw ' + settings.gateway + ' ' + device), (error, stdout, stderr) => {
+      (settings.wpaType === 'none' ? '' : '&& iwconfig ' + device + ' key s:' + settings.password) +
+      ' && ip addr flush ' + device +
+      ' && ip addr add ' + settings.ipaddress + '/16 dev ' + device +
+      ' && ip link set ' + device + ' up' +
+      (settings.gateway === '' ? '' : '&& route add default gw ' + settings.gateway + ' ' + device), (error, stdout, stderr) => {
         if (stderr) {
           console.log(`exec error: ${error}`)
-          this.winston.error('Error in setAdapter() ', { message: stderr })
           return callback(stderr)
         }
-        this.winston.error('Status in setAdapter() ', { message: stdout })
         // refresh
         console.log('Activate Adhoc Success')
         this.getAdapters((err, netStatusList, netDeviceSelected, settings) => {
           if (!err) {
             callback(null, netStatusList, netDeviceSelected, settings)
           } else {
-            this.winston.error('Error in /api/setAdapter ', { message: err })
             // reset back to managed
-            execSync('sudo ip link set ' + device + ' down && sleep 1 && nmcli dev set ' + device + ' managed yes')
+            execSync('ip link set ' + device + ' down && sleep 1 && nmcli dev set ' + device + ' managed yes')
             callback(err, netStatusList, netDeviceSelected, settings)
           }
         })
@@ -178,10 +169,9 @@ class adhocManager {
     } else {
       // deactivate
       console.log('Deactivate Adhoc')
-      exec('sudo ip link set ' + device + ' down && sleep 1 && nmcli dev set ' + device + ' managed yes', (error, stdout, stderr) => {
+      exec('ip link set ' + device + ' down && sleep 1 && nmcli dev set ' + device + ' managed yes', (error, stdout, stderr) => {
         if (stderr) {
           console.error(`exec error: ${error}`)
-          this.winston.error('Error in setAdapter() ', { message: stderr })
           return callback(stderr)
         }
         // refresh
@@ -189,7 +179,6 @@ class adhocManager {
           if (!err) {
             callback(null, netStatusList, netDeviceSelected, settings)
           } else {
-            this.winston.error('Error in /api/setAdapter ', { message: err })
             callback(err, netStatusList, netDeviceSelected, settings)
           }
         })

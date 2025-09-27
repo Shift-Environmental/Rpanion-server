@@ -1,0 +1,51 @@
+#!/bin/sh
+# Setup system user
+if ! getent passwd "rpanion" >/dev/null
+then
+    adduser --system --group --home /home/rpanion --quiet rpanion
+fi
+
+sudo usermod -a -G plugdev rpanion
+sudo usermod -a -G dialout rpanion
+sudo usermod -a -G netdev rpanion
+sudo usermod -a -G gpio rpanion
+sudo usermod -a -G video rpanion
+sudo usermod -a -G adm rpanion    # for systemd journal access
+sudo usermod -a -G render rpanion   # for access to hardware video encoding on Jetson Orin
+sudo usermod -a -G networkmanager rpanion   # for access to nmcli
+
+# Set permissions
+chown -R rpanion /usr/share/rpanion-server
+chown -R rpanion /etc/rpanion-server
+chown -R rpanion /etc/wireguard
+chmod +x /usr/share/rpanion-server/app/server/index.js
+systemctl daemon-reload
+systemctl enable rpanion-server
+systemctl start rpanion-server
+
+# Allow relevant services to be disabled or enabled without password
+cat <<EOF > /etc/sudoers.d/allow-vpn-control
+rpanion ALL=(ALL) NOPASSWD: \
+  /usr/bin/systemctl disable wg-quick@*, \
+  /usr/bin/systemctl enable wg-quick@*, \
+  /usr/bin/wg-quick down *, \
+  /usr/bin/wg-quick up *, \
+  /usr/bin/wg show *, \
+  /usr/sbin/zerotier-cli join *, \
+  /usr/sbin/zerotier-cli leave *, \
+  /usr/sbin/zerotier-cli listnetworks *, \
+  /usr/sbin/zerotier-cli info, \
+  /usr/sbin/shutdown *, \
+  /usr/bin/nmcli *, \
+  /usr/sbin/pppd *, \
+  /usr/sbin/iw dev * scan ap-force
+EOF
+
+chmod 440 /etc/sudoers.d/allow-vpn-control
+
+
+#install pymavlink
+echo "Installing pymavlink Python package to rpanion..."
+sudo -u rpanion PIP_BREAK_SYSTEM_PACKAGES=1 pip install pymavlink --user
+sudo -u rpanion echo "export PATH=\$PATH:/home/rpanion/.local/bin" >> /home/rpanion/.profile
+

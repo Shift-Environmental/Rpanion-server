@@ -1,0 +1,104 @@
+name: Build Debian Package
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+    build:
+        runs-on: ubuntu-22.04
+        strategy:
+          matrix:
+            arch: [amd64, arm64]
+        steps:
+        - uses: actions/checkout@v5
+
+        - name: Use Node.js 20.x
+          uses: actions/setup-node@v5
+          with:
+            node-version: 20.x
+            cache: 'npm'
+
+        #- name: Regenerate package-lock.json for arm64
+        #  if: matrix.arch == 'arm64'
+        #  run: |
+        #    if [ -f package-lock.json ]; then
+        #      rm package-lock.json
+        #    fi
+        #    npm install --package-lock-only
+
+        - name: Install dependencies
+          run: npm ci
+
+        - name: Insert architecture into package.json
+          run: |
+            # Update package.json with the architecture
+            jq --arg arch "${{ matrix.arch }}" '.node_deb.architecture = $arch' package.json > tmp.json && mv tmp.json package.json
+
+        - name: Download pre-built mavlink-router
+          run: |
+            mkdir -p ./additional/usr/share/rpanion-server/app/
+            
+            # Set the mavlink-router version to download
+            MAVLINK_ROUTER_VERSION="4"
+            
+            # Download the appropriate binary based on architecture
+            if [ "${{ matrix.arch }}" = "arm64" ]; then
+              echo "Downloading mavlink-router for ARM64"
+              wget -O ./additional/usr/share/rpanion-server/app/mavlink-routerd \
+                "https://github.com/mavlink-router/mavlink-router/releases/download/v${MAVLINK_ROUTER_VERSION}/mavlink-routerd-glibc-aarch64" 
+            else
+              echo "Downloading mavlink-router for AMD64"
+              wget -O ./additional/usr/share/rpanion-server/app/mavlink-routerd \
+                "https://github.com/mavlink-router/mavlink-router/releases/download/v${MAVLINK_ROUTER_VERSION}/mavlink-routerd-glibc-x86_64"
+            fi
+            
+            # Make the binary executable
+            chmod +x ./additional/usr/share/rpanion-server/app/mavlink-routerd
+            
+            # Verify the downloaded binary
+            file ./additional/usr/share/rpanion-server/app/mavlink-routerd
+
+        - name: Build package
+          run: npm run package
+
+        - name: Repackage using xz for earlier Debian versions
+          run: |
+            for file in rpanion-server_*.deb; do
+              dpkg-deb -R "$file" temp_dir
+              dpkg-deb -bZxz temp_dir "${file%.deb}.xz"
+              rm -rf temp_dir
+              rm -rf "$file"
+              mv "${file%.deb}.xz" "$file"
+            done
+
+        - name: Archive build
+          uses: actions/upload-artifact@v4
+          with:
+            name: rpanion-server-${{ matrix.arch }}.deb
+            path: 'rpanion-server_*.deb'
+            retention-days: 7
+    deploy:
+      if: github.event_name != 'pull_request'
+      needs: build  # This ensures deploy only runs after all matrix builds complete
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v5
+        - name: Download all artifacts
+          uses: actions/download-artifact@v5
+          with:
+            path: artifacts/
+        - name: Release
+          uses: "softprops/action-gh-release@v2"
+          if: startsWith(github.ref, 'refs/tags/v')
+          with:
+            prerelease: false
+            files: |
+              artifacts/rpanion-server-amd64.deb/rpanion-server_*.deb
+              artifacts/rpanion-server-arm64.deb/rpanion-server_*.deb
+            token: "${{ secrets.GITHUB_TOKEN }}"
+        - name: Delete existing pre-release
+          if: github.ref == 'refs/heads/master'
+          run: |
+            gh release delete latest --yes || true
+          env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
