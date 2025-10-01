@@ -1,4 +1,4 @@
-// Mavlink Manager
+// Mavlink Manager with GCS Connection Management (Priority by System ID)
 const events = require('events')
 const udp = require('dgram')
 const { MavLinkPacketSplitter, MavLinkPacketParser, MavLinkProtocolV2, minimal, common, ardupilotmega, MavLinkProtocolV1 } = require('node-mavlink')
@@ -11,13 +11,43 @@ const REGISTRY = {
   ...ardupilotmega.REGISTRY
 }
 
+// Custom MAV_CMD for relinquishing control
+const MAV_CMD_RELINQUISH_CONTROL = 45000
+
+class GCSConnection {
+  constructor(sysId, compId, address, port) {
+    this.sysId = sysId
+    this.compId = compId
+    this.address = address
+    this.port = port
+    this.lastHeartbeat = Date.now()
+    this.isActive = false
+  }
+
+  updateHeartbeat() {
+    this.lastHeartbeat = Date.now()
+  }
+
+  isAlive(timeout = 5000) {
+    return (Date.now() - this.lastHeartbeat) < timeout
+  }
+}
+
 class mavManager {
-  constructor (version, inudpIP, inudpPort, enableDSRequest) {
+  constructor (version, inudpIP, inudpPort, enableDSRequest, gcsHeartbeatTimeout = 5000) {
     this.mav = null
     this.mavmsg = null
     this.version = version
 
     this.eventEmitter = new events.EventEmitter()
+
+    // GCS Connection Management
+    this.gcsConnections = new Map() // Map of sysId -> GCSConnection
+    this.activeGCS = null // sysId of active controller
+    this.gcsHeartbeatTimeout = gcsHeartbeatTimeout
+
+    // Start GCS heartbeat monitoring
+    this.startGCSMonitoring()
 
     // are we in a system reboot?
     this.isRebooting = false
@@ -81,24 +111,38 @@ class mavManager {
       const clazz = REGISTRY[packet.header.msgid]
       if (!clazz) {
         // bad message - can't process here any further
-        // console.log("Generic: ", packet)
         this.eventEmitter.emit('gotMessage', packet, null)
         return
       }
       const data = packet.protocol.data(packet.payload, clazz)
-      // console.log(packet)
+
+      // Handle GCS heartbeats first
+      if (this.isGCS(data.type) && packet.header.msgid === minimal.Heartbeat.MSG_ID) {
+        this.handleGCSHeartbeat(packet, data)
+        return // Don't process GCS heartbeats further
+      }
+
+      // Block ALL messages from non-active GCS (except heartbeats handled above)
+      if (this.gcsConnections.has(packet.header.sysid) && !this.isActiveGCS(packet.header.sysid)) {
+        // This is from a GCS but not the active one - block it
+        return
+      }
 
       // set the target system/comp ID if needed
       // ensure it's NOT a GCS, as mavlink-router will sometimes route
       // messages from connected GCS's
-      if (this.targetSystem === null && packet.header.msgid === minimal.Heartbeat.MSG_ID && data.type !== 6
-        && data.type !== 18 && data.type !== 27) {
+      if (this.targetSystem === null && packet.header.msgid === minimal.Heartbeat.MSG_ID && !this.isGCS(data.type)) {
         console.log('Vehicle is S/C: ' + packet.header.sysid + '/' + packet.header.compid)
         this.targetSystem = packet.header.sysid
         this.targetComponent = packet.header.compid
 
         // send off initial messages
         this.sendVersionRequest()
+
+        // Handle relinquish control command
+      } else if (packet.header.msgid === common.CommandLong.MSG_ID && data.command === MAV_CMD_RELINQUISH_CONTROL) {
+        this.handleRelinquishControl(packet, data)
+        return
 
         // Respond to MavLink commands that are targeted to the companion computer
       } else if (data.targetSystem === this.targetSystem &&
@@ -122,7 +166,9 @@ class mavManager {
 
       this.statusNumRxPackets += 1
       this.timeofLastPacket = (Date.now().valueOf())
-      if (packet.header.msgid === minimal.Heartbeat.MSG_ID) {
+
+      // Process vehicle heartbeats to identify target system/component
+      if (packet.header.msgid === minimal.Heartbeat.MSG_ID && !this.isGCS(data.type)) {
         // System status
         this.statusFWName = data.autopilot
         this.statusVehType = data.type
@@ -146,6 +192,124 @@ class mavManager {
         console.log(this.fcVersion)
       }
     })
+  }
+
+  isGCS(mavType) {
+    return mavType === minimal.MavType.GCS;
+  }
+
+  handleGCSHeartbeat(packet, data) {
+    const sysId = packet.header.sysid
+    
+    if (!this.gcsConnections.has(sysId)) {
+      // New GCS connection
+      const gcs = new GCSConnection(sysId, packet.header.compid, this.RinudpIP, this.RinudpPort)
+      this.gcsConnections.set(sysId, gcs)
+      console.log(`New GCS connected: sysId=${sysId}, compId=${packet.header.compid}`)
+      
+      // Check if this should be the active controller
+      this.updateActiveGCS()
+    } else {
+      // Update existing GCS heartbeat
+      this.gcsConnections.get(sysId).updateHeartbeat()
+    }
+  }
+
+  handleRelinquishControl(packet, data) {
+    const sysId = packet.header.sysid
+    
+    console.log(`GCS sysId=${sysId} requesting to relinquish control`)
+    
+    if (sysId === this.activeGCS) {
+      // Active controller is relinquishing - remove it and find new active
+      this.gcsConnections.delete(sysId)
+      console.log(`GCS sysId=${sysId} relinquished control and disconnected`)
+      this.updateActiveGCS()
+      this.sendCommandAck(data.command, 0, packet.header.sysid, packet.header.compid, minimal.MavComponent.ONBOARD_COMPUTER)
+    } else {
+      // Not the active controller
+      console.log(`GCS sysId=${sysId} is not active controller, cannot relinquish`)
+      this.sendCommandAck(data.command, 4, packet.header.sysid, packet.header.compid, minimal.MavComponent.ONBOARD_COMPUTER) // MAV_RESULT_DENIED
+    }
+  }
+
+  updateActiveGCS() {
+    // Find the alive GCS with the highest system ID
+    let newActive = null
+    let highestSysId = -1
+
+    for (const [sysId, gcs] of this.gcsConnections.entries()) {
+      if (gcs.isAlive(this.gcsHeartbeatTimeout) && sysId > highestSysId) {
+        highestSysId = sysId
+        newActive = sysId
+      }
+    }
+
+    // Update active GCS if it changed
+    if (newActive !== this.activeGCS) {
+      // Clear old active flag
+      if (this.activeGCS && this.gcsConnections.has(this.activeGCS)) {
+        this.gcsConnections.get(this.activeGCS).isActive = false
+      }
+
+      this.activeGCS = newActive
+
+      if (newActive) {
+        this.gcsConnections.get(newActive).isActive = true
+        console.log(`GCS sysId=${newActive} is now the ACTIVE controller`)
+        this.eventEmitter.emit('activeGCSChanged', this.gcsConnections.get(newActive))
+      } else {
+        console.log('No active GCS controller')
+        this.eventEmitter.emit('noActiveGCS')
+      }
+    }
+  }
+
+  startGCSMonitoring() {
+    // Check GCS heartbeats every 2 seconds
+    this.gcsMonitorInterval = setInterval(() => {
+      this.checkGCSHeartbeats()
+    }, 2000)
+  }
+
+  checkGCSHeartbeats() {
+    let needsUpdate = false
+
+    // Remove timed out GCS connections
+    for (const [sysId, gcs] of this.gcsConnections.entries()) {
+      if (!gcs.isAlive(this.gcsHeartbeatTimeout)) {
+        console.log(`GCS sysId=${sysId} timed out`)
+        this.eventEmitter.emit('gcsTimeout', gcs)
+        this.gcsConnections.delete(sysId)
+        
+        if (sysId === this.activeGCS) {
+          needsUpdate = true
+        }
+      }
+    }
+
+    // Update active GCS if needed
+    if (needsUpdate) {
+      this.updateActiveGCS()
+    }
+  }
+
+  isActiveGCS(sysId) {
+    if (this.activeGCS === null) return true // No GCS management yet
+    return sysId === this.activeGCS
+  }
+
+  getGCSStatus() {
+    const backupGCS = Array.from(this.gcsConnections.values())
+      .filter(gcs => gcs.sysId !== this.activeGCS)
+      .sort((a, b) => b.sysId - a.sysId) // Sort by system ID descending
+
+    return {
+      activeGCS: this.activeGCS,
+      activeGCSDetails: this.activeGCS ? this.gcsConnections.get(this.activeGCS) : null,
+      backupGCS: backupGCS,
+      totalGCS: this.gcsConnections.size
+    }
   }
 
   decodeFlightSwVersion (flightSwVersion) {
@@ -181,6 +345,9 @@ class mavManager {
 
   close () {
     // close cleanly
+    if (this.gcsMonitorInterval) {
+      clearInterval(this.gcsMonitorInterval)
+    }
     if (this.udpStream) {
       this.udpStream.close()
     }
@@ -193,6 +360,10 @@ class mavManager {
     this.RinudpIP = null
     this.targetSystem = null
     this.targetComponent = null
+
+    // Clear GCS connections
+    this.gcsConnections.clear()
+    this.activeGCS = null
 
     this.udpStream = udp.createSocket('udp4')
     this.statusBytesPerSec = { avgBytesSec: 0, bytes: 0, lastTime: Date.now().valueOf() }
@@ -220,6 +391,7 @@ class mavManager {
     })
 
     this.udpStream.bind(this.inudpPort, this.inudpIP)
+    this.startGCSMonitoring()
   }
 
   sendData (msg, component) {
