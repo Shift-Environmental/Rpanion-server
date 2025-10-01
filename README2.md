@@ -61,7 +61,9 @@ System ID 100 reconnects:
 
 ## Relinquishing Control
 
-The active controller can voluntarily give up control by sending the **Relinquish Control** command (MAVLink command 45000).
+The active controller can voluntarily give up control by sending the **Relinquish Control** command
+
+The Relinquish Control command is sent as a MAVLink `COMMAND_LONG` message (message ID 76). The COMMAND_LONG message is a standard MAVLink message type used to send various commands, with a command field specifying the action. In this case, the command field is set to `45000`, which uniquely represents `MAV_CMD_RELINQUISH_CONTROL` in mavManager.js.
 
 ### What Happens When You Relinquish:
 1. Your GCS connection is removed from the system
@@ -93,8 +95,9 @@ If you're the only connected GCS and relinquish control:
 
 ## Technical Details
 
-- **Heartbeat timeout**: 5 seconds (configurable)
-- **Relinquish command**: MAV_CMD 45000
-- **GCS detection**: MAVLink types 6, 18, 27
-- **Priority method**: Highest System ID wins
-- **Monitoring interval**: Every 2 seconds
+- **Heartbeat timeout**: `5 seconds` (hard-coded in mavManager.js)
+- **Relinquish command**: `COMMAND_LONG (76)` { command: 45000 }
+- **GCS detection**: MAVLink type `6` (minimal.MavType.GCS)
+- **Initial Control**: First controller to connect becomes the active controller.
+- **Fallback priority**: Backup controller with highest System ID becomes the active controller
+- **Monitoring interval**: Every `2 seconds` (hard-coded in mavManager.js)
