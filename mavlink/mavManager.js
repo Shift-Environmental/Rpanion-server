@@ -1,4 +1,4 @@
-// Mavlink Manager with GCS Connection Management (Priority by System ID)
+// Mavlink Manager with GCS Connection Management / Relinquish Control
 const events = require('events')
 const udp = require('dgram')
 const { MavLinkPacketSplitter, MavLinkPacketParser, MavLinkProtocolV2, minimal, common, ardupilotmega, MavLinkProtocolV1 } = require('node-mavlink')
