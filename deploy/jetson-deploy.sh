@@ -7,6 +7,7 @@ git submodule update --init --recursive
 
 ## Set permissions
 sudo adduser $USER dialout
+sudo adduser $USER tty
 sudo systemctl disable nvgetty.service
 
 ## Packages
@@ -14,7 +15,7 @@ sudo systemctl disable nvgetty.service
 
 sudo systemctl disable dnsmasq
 
-sudo apt-get install -y ca-certificates curl gnupg
+sudo apt-get install -y ca-certificates curl gnupg nvidia-l4t-gstreamer
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
 #Ubuntu 18 (Jetson) doesn't like modern nodejs
@@ -35,13 +36,20 @@ sudo sed -i.bak -e '/^\[main\]/aauth-polkit=false' /etc/NetworkManager/NetworkMa
 sudo touch /etc/NetworkManager/conf.d/10-globally-managed-devices.conf
 echo "[keyfile]" | sudo tee -a /etc/NetworkManager/conf.d/10-globally-managed-devices.conf >/dev/null
 echo "unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma,except:type:wwan,except:type:ethernet,type:vlan" | sudo tee -a /etc/NetworkManager/conf.d/10-globally-managed-devices.conf >/dev/null
-sudo service network-manager restart
+if systemctl list-units --full -all | grep -Fq 'network-manager.service'; then
+    sudo service network-manager restart
+fi
+if systemctl list-units --full -all | grep -Fq 'NetworkManager.service'; then
+    sudo service NetworkManager restart
+fi
 
-## mavlink-router
-./build_mavlinkrouter.sh
-
-## and build & run Rpanion
-./build_rpanion.sh
+## and build Rpanion dev
+# If less than 520Mb RAM, need to tell NodeJS to reduce memory usage during build
+if [ $(free -m | awk '/^Mem:/{print $2}') -le 520 ]; then
+    export NODE_OPTIONS="--max-old-space-size=256"
+fi
+cd ../
+npm install
 
 ## For wireguard. Must be installed last as it messes the DNS resolutions
 sudo apt install -y resolvconf

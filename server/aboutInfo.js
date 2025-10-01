@@ -1,13 +1,20 @@
 const process = require('process')
 const { exec, spawn, execSync } = require('child_process')
 const si = require('systeminformation')
-const winston = require('./winstonconfig')(module)
 
 function getSoftwareInfo (callback) {
   // get the OS, Node.js and Rpanion-server versions
   si.osInfo(function (data) {
     const swstring = '' + data.distro + ' - ' + data.release + ' (' + data.codename + ')'
-    return callback(swstring, process.version, process.env.npm_package_version, data.hostname, null)
+    let rpanionVersion = process.env.npm_package_version
+    if (process.env.NODE_ENV !== 'development') {
+      try {
+        rpanionVersion = execSync('dpkg -l | awk \'$2=="rpanion-server" { print $3 }\'').toString().trim()
+      } catch (err) {
+        console.log('Error getting rpanion-server version:', err)
+      }
+    }
+    return callback(swstring, process.version, rpanionVersion, data.hostname, null)
   })
 }
 
@@ -26,40 +33,32 @@ function getDiskInfo (callback) {
 /*function rebootCC () {
   // reboot the companion computer
   console.log('Reboot now')
-  winston.info('Reboot now')
-  exec('sudo reboot', function (error, stdout, stderr) {
+  exec('reboot', function (error, stdout, stderr) {
     if (error) {
       console.log(error)
-      winston.info(error)
     }
     console.log(stdout)
-    winston.info(stdout)
   })
 }*/
 
 function shutdownCC () {
   // shutdown the companion computer
   console.log('Shutting down')
-  winston.info('Shutting down')
   exec('sudo shutdown now', function (error, stdout) {
     if (error) {
       console.log(error)
-      winston.info(error)
     }
     console.log(stdout)
-    winston.info(stdout)
   })
 }
 
-function updateRS (io) {
+/*function updateRS (io) {
   // update Rpanion-server
   console.log('Upgrading')
-  winston.info('Upgrading')
   io.sockets.emit('upgradeStatus', 'InProgress')
   const ug = spawn('bash', ['./deploy/upgrade.sh'], { shell: true })
   ug.stdout.on('data', function (data) {
     console.log('stdout: ' + data.toString())
-    winston.info('stdout: ' + data.toString())
     io.sockets.emit('upgradeText', data.toString())
     io.sockets.emit('upgradeStatus', 'InProgress')
     if (data.toString().trim() === '---Upgrade Complete---') {
@@ -69,7 +68,6 @@ function updateRS (io) {
 
   ug.stderr.on('data', function (data) {
     console.log('Upgrade fail: ' + data.toString())
-    winston.info('Upgrade fail: ' + data.toString())
     io.sockets.emit('upgradeText', data.toString())
     io.sockets.emit('upgradeStatus', 'InProgress')
     if (data.toString().trim() === '---Upgrade Complete---') {
@@ -79,11 +77,10 @@ function updateRS (io) {
 
   ug.on('exit', function (code) {
     console.log('Upgrade complete: ' + code.toString())
-    winston.info('Upgrade complete: ' + code.toString())
     io.sockets.emit('upgradeText', '---Upgrade Complete (' + code.toString() + ')---')
     io.sockets.emit('upgradeStatus', 'Complete')
   })
-}
+} */
 
 function getHardwareInfo (callback) {
   // define all values, you want to get back
@@ -117,4 +114,21 @@ function getHardwareInfo (callback) {
   })
 }
 
-module.exports = { getSoftwareInfo, getHardwareInfo, getDiskInfo, shutdownCC, updateRS }
+function getsystemctllog(callback) {
+  // get the systemctl log
+  exec('journalctl -u rpanion-server.service -n 1000 --no-pager', (error, stdout, stderr) => {
+    if (error) {
+      console.log(`getsystemctllog exec error: ${error}`)
+      return callback(error.toString())
+    }
+    if (stderr) {
+      console.log(`getsystemctllog stderr: ${stderr}`)
+      return callback(stderr.toString())
+    }
+    // for security, remove the bearer token from the log
+    const log = stdout.toString().replace(/Bearer [a-zA-Z0-9-_.]+/g, 'Bearer <token>')
+    return callback(log)
+  })
+}
+
+module.exports = { getSoftwareInfo, getHardwareInfo, getDiskInfo, shutdownCC, getsystemctllog }

@@ -1,54 +1,73 @@
 {
-  "name": "Rpanion-server",
-  "version": "0.10.0",
+  "name": "rpanion-server",
+  "version": "0.11.4",
   "private": true,
   "secure": false,
   "dependencies": {
     "app-root-path": "^3.1.0",
+    "bcryptjs": "^3.0.2",
     "bootstrap": "^5.3.1",
-    "compression": "^1.7.4",
+    "compression": "^1.8.1",
+    "express": "^5.1.0",
     "express-fileupload": "^1.4.0",
     "express-rate-limit": "^7.4.1",
     "express-validator": "^7.0.1",
+    "jsonwebtoken": "^9.0.2",
     "moment": "^2.29.4",
     "node-mavlink": "^2.0.5",
-    "npm": "^10.5.2",
-    "ntrip-client": "^1.1.1",
-    "nyc": "^17.1.0",
+    "npm": "^11.3.0",
     "prop-types": "^15.8.1",
-    "react": "^18.2.0",
+    "react": "^19.1.0",
     "react-bootstrap": "^2.8.0",
-    "react-dom": "^18.2.0",
-    "react-helmet": "^6.1.0",
-    "react-router-dom": "^6.15.0",
-    "react-scripts": "^5.0.1",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.5.2",
     "react-select": "^5.7.4",
     "rsync": "^0.6.1",
-    "serialport": "^12.0.0",
+    "serialport": "^13.0.0",
     "settings-store": "^1.4.1",
-    "shx": "^0.3.4",
     "socket.io": "^4.8.0",
     "socket.io-client": "^4.7.2",
     "startbootstrap-simple-sidebar": "^6.0.6",
-    "systeminformation": "^5.21.7",
-    "winston": "^3.10.0"
+    "systeminformation": "^5.23.8",
+    "vite": "^6.3.6"
   },
   "bin": {
     "coveralls": "./bin/coveralls.js"
   },
   "scripts": {
-    "start": "DISABLE_ESLINT_PLUGIN=true react-scripts start",
-    "build": "DISABLE_ESLINT_PLUGIN=true react-scripts build",
-    "testfront": "DISABLE_ESLINT_PLUGIN=true react-scripts test",
-    "testback": " mocha --exit ./server/*.test.js ./mavlink/*.test.js",
-    "mocha": "_mocha --exit ./server/*.test.js ./mavlink/*.test.js",
-    "test-cov": "nyc npm run mocha",
-    "test-coveralls": "nyc npm run mocha && shx cat ./coverage/lcov.info | node ./bin/coveralls.js --verbose",
+    "start": "vite",
+    "build": "vite build",
+    "testfront": "NODE_ENV=development vitest --run ./src",
+    "testback": "NODE_ENV=development mocha --exit ./server/*.test.js ./mavlink/*.test.js",
+    "mocha": "NODE_ENV=development _mocha --exit ./server/*.test.js ./mavlink/*.test.js",
+    "test-cov": "nyc npm run mocha && nyc report --reporter=text-lcov",
+    "test-coveralls": "nyc npm run mocha && nyc report --reporter=text-lcov | coveralls",
     "lint": "eslint .",
-    "eject": "react-scripts eject",
     "server": "node-env-run server --exec nodemon | pino-colada",
-    "service": "node ./server/index.js",
-    "dev": "run-p server start"
+    "serviceDev": "npm run build && NODE_ENV=development node ./server/index.js",
+    "dev": "NODE_ENV=development run-p server start",
+    "preview": "vite preview",
+    "package": "npm run build && mkdir -p ./additional/etc/rpanion-server/config && cp ./config/user.json ./additional/etc/rpanion-server/config && mkdir -p ./additional/usr/share/rpanion-server/app/server && node-deb --verbose --extra-files additional -- server mavlink build python && rm -r ./additional"
+  },
+  "node_deb": {
+    "entrypoints": {
+      "daemon": "./server/index.js"
+    },
+    "init": "systemd",
+    "dependencies": "nodejs (>= 20.0.0), gstreamer1.0-plugins-good (>= 1.20.0), libgstrtspserver-1.0-dev (>= 1.20.0), gstreamer1.0-plugins-base-apps (>= 1.20.0), gstreamer1.0-plugins-ugly (>= 1.20.0), gstreamer1.0-plugins-bad (>= 1.20.0), network-manager (>= 1.30.0), python3 (>= 3.9.0), python3-dev (>= 3.9.0), python3-gst-1.0 (>= 1.20.0), python3-pip (>= 20.0.0), dnsmasq (>= 2.85), libxslt1-dev (>= 1.1.34), python3-lxml (>= 4.8.0), python3-numpy (>= 1.21.0), python3-future (>= 0.18.0), libunwind-dev (>= 1.3.0)",
+    "user": "rpanion",
+    "group": "rpanion",
+    "install_strategy": "copy",
+    "maintainer": "Stephen Dade (stephen_dade@hotmail.com)",
+    "architecture": "${DEB_HOST_ARCH}",
+    "description": "A node.js based server for companion computers used in Mavlink-based vehicles (ie Ardupilot, PX4). It presents a web-based interface (running on the companion computer), where system settings such as network, telemetry and video streaming can be configured from.",
+    "templates": {
+      "systemd_service": "./debian/systemd.service",
+      "preinst": "./debian/preinst",
+      "postinst": "./debian/postinst",
+      "postrm": "./debian/postrm",
+      "prerm": "./debian/prerm"
+    }
   },
   "proxy": "http://localhost:3001",
   "browserslist": [
@@ -58,24 +77,26 @@
     "not op_mini all"
   ],
   "devDependencies": {
-    "@eslint/js": "^9.13.0",
-    "body-parser": "^1.20.2",
-    "chai": "^4.5.0",
-    "chai-http": "^4.4.0",
-    "coveralls": "^3.1.1",
-    "eslint": "^8.57.1",
+    "@eslint/js": "^9.23.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "coveralls-next": "^4.2.2",
+    "eslint": "^9.24.0",
     "eslint-plugin-mocha": "^10.5.0",
-    "eslint-plugin-react": "^7.37.2",
-    "express": "^4.21.1",
-    "globals": "^15.11.0",
-    "mocha": "^10.2.0",
+    "eslint-plugin-react": "^7.37.5",
+    "globals": "^16.0.0",
+    "happy-dom": "^17.4.4",
+    "mocha": "^11.1.0",
     "mocha-lcov-reporter": "^1.3.0",
+    "node-deb": "^0.10.7",
     "node-env-run": "^4.0.2",
-    "nodemon": "^3.0.1",
+    "nodemon": "^3.1.9",
     "npm-run-all": "^4.1.5",
+    "nyc": "^17.1.0",
     "pino-colada": "^2.2.2",
     "pino-http": "^10.3.0",
-    "should": "^13.2.3"
+    "sinon": "^21.0.0",
+    "vite-plugin-eslint": "^1.8.1",
+    "vitest": "^3.1.1"
   },
   "nyc": {
     "all": true,
@@ -92,6 +113,9 @@
     ]
   },
   "overrides": {
-    "autoprefixer": "10.4.5"
+    "autoprefixer": "10.4.5",
+    "vite": {
+      "rollup": "npm:@rollup/wasm-node"
+    }
   }
 }
