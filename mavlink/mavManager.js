@@ -125,6 +125,7 @@ class mavManager {
       // Block ALL messages from non-active GCS (except heartbeats handled above)
       if (this.gcsConnections.has(packet.header.sysid) && !this.isActiveGCS(packet.header.sysid)) {
         // This is from a GCS but not the active one - block it
+        console.log(`[MAV-MANAGER] Blocked message (msgId=${packet.header.msgid}) from non-active GCS sysId=${packet.header.sysid}`)
         return
       }
 
@@ -213,6 +214,7 @@ class mavManager {
       this.updateActiveGCS()
     } else {
       // Update existing GCS heartbeat
+      console.log(`Received heartbeat from sysId=${sysId}`)
       this.gcsConnections.get(sysId).updateHeartbeat()
     }
   }
@@ -220,17 +222,16 @@ class mavManager {
   handleRelinquishControl(packet, data) {
     const sysId = packet.header.sysid
     
-    console.log(`GCS sysId=${sysId} requesting to relinquish control`)
+    console.log(`[MAV-MANAGER] GCS sysId=${sysId} wants to relinquish control`)
     
     if (sysId === this.activeGCS) {
       // Active controller is relinquishing - remove it and find new active
       this.gcsConnections.delete(sysId)
-      console.log(`GCS sysId=${sysId} relinquished control and disconnected`)
       this.updateActiveGCS()
       this.sendCommandAck(data.command, 0, packet.header.sysid, packet.header.compid, minimal.MavComponent.ONBOARD_COMPUTER)
     } else {
       // Not the active controller
-      console.log(`GCS sysId=${sysId} is not active controller, cannot relinquish`)
+      console.log(`[MAV-MANAGER] GCS sysId=${sysId} is not active controller, cannot relinquish (denied)`)
       this.sendCommandAck(data.command, 4, packet.header.sysid, packet.header.compid, minimal.MavComponent.ONBOARD_COMPUTER) // MAV_RESULT_DENIED
     }
   }
@@ -258,13 +259,28 @@ class mavManager {
 
       if (newActive) {
         this.gcsConnections.get(newActive).isActive = true
-        console.log(`GCS sysId=${newActive} is now the ACTIVE controller`)
+        console.log(`[MAV-MANAGER] GCS sysId=${newActive} is now the ACTIVE controller`)
         this.eventEmitter.emit('activeGCSChanged', this.gcsConnections.get(newActive))
       } else {
-        console.log('No active GCS controller')
         this.eventEmitter.emit('noActiveGCS')
       }
+      
+      // Log current GCS state
+      this.logGCSState()
     }
+  }
+
+  logGCSState() {
+    console.log(`[MAV-MANAGER] --- Current GCS State ---`)
+    console.log(`[MAV-MANAGER] Total connected: ${this.gcsConnections.size}`)
+    console.log(`[MAV-MANAGER] Active: ${this.activeGCS || 'none'}`)
+    const backups = Array.from(this.gcsConnections.keys())
+      .filter(id => id !== this.activeGCS)
+      .sort((a, b) => b - a)
+    if (backups.length > 0) {
+      console.log(`[MAV-MANAGER] Backups (priority order): ${backups.join(', ')}`)
+    }
+    console.log(`[MAV-MANAGER] -----------------------`)
   }
 
   startGCSMonitoring() {
@@ -280,11 +296,12 @@ class mavManager {
     // Remove timed out GCS connections
     for (const [sysId, gcs] of this.gcsConnections.entries()) {
       if (!gcs.isAlive(this.gcsHeartbeatTimeout)) {
-        console.log(`GCS sysId=${sysId} timed out`)
+        const wasActive = (sysId === this.activeGCS)
+        console.log(`[MAV-MANAGER] GCS sysId=${sysId} timed out (${wasActive ? 'WAS ACTIVE' : 'was backup'})`)
         this.eventEmitter.emit('gcsTimeout', gcs)
         this.gcsConnections.delete(sysId)
         
-        if (sysId === this.activeGCS) {
+        if (wasActive) {
           needsUpdate = true
         }
       }
@@ -292,6 +309,7 @@ class mavManager {
 
     // Update active GCS if needed
     if (needsUpdate) {
+      console.log(`[MAV-MANAGER] Active controller timed out, promoting next highest priority...`)
       this.updateActiveGCS()
     }
   }
@@ -421,9 +439,6 @@ class mavManager {
       if (error) {
         this.udpStream.close()
         console.log(error)
-      } else {
-        // console.log(msgbuf)
-        // console.log(buf)
       }
     })
   }
@@ -530,16 +545,9 @@ class mavManager {
     const msgset = []
     const maxBytes = 180
     while (buf.length > maxBytes) {
-      //if (buf.length > maxBytes) {
         // slice
         msgset.push(buf.slice(0, maxBytes))
         buf = buf.slice(maxBytes)
-      //} else {
-        // need to pad to 180 chars? No, message packing
-        // will do this for us
-      //  msgset.push(buf)
-      //  break
-      //}
     }
     msgset.push(buf)
 
