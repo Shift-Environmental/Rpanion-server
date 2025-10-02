@@ -15,7 +15,6 @@ System ID priority is only used when the active controller disconnects or relinq
 - **Higher System ID = Higher Priority** for fallback
 - When the active GCS disconnects, the backup GCS with the highest System ID takes over
 - A newly connected GCS with a high System ID will NOT automatically take control from an active GCS
-- Priority only matters when selecting a new active controller
 
 ### Example Control Scenario
 ```
