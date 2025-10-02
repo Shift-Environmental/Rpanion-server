@@ -140,7 +140,8 @@ class mavManager {
         this.sendVersionRequest()
 
         // Handle relinquish control command
-      } else if (packet.header.msgid === common.CommandLong.MSG_ID && data.command === MAV_CMD_RELINQUISH_CONTROL) {
+      } else if (packet.header.msgid === common.CommandLong.MSG_ID && 
+                 data.command === MAV_CMD_RELINQUISH_CONTROL) {
         this.handleRelinquishControl(packet, data)
         return
 
@@ -195,7 +196,8 @@ class mavManager {
   }
 
   isGCS(mavType) {
-    return mavType === minimal.MavType.GCS;
+    // Check if the MAV type is a GCS
+    return mavType === 6 || mavType === 18 || mavType === 27
   }
 
   handleGCSHeartbeat(packet, data) {
