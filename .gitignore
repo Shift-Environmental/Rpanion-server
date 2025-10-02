@@ -33,3 +33,6 @@ settingsTest.json
 /rpanion-server_*
 
 pnpm-lock.yaml
+
+settings.json
+mavlink-router/
