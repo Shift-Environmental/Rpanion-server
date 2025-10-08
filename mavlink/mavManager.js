@@ -197,8 +197,8 @@ class mavManager {
   }
 
   isGCS(mavType) {
-    // Check if the MAV type is a GCS
-    return mavType === 6 || mavType === 18 || mavType === 27
+    // Check if the MAV type is a GCS (6)
+    return mavType === minimal.MavType.GCS
   }
 
   handleGCSHeartbeat(packet, data) {
