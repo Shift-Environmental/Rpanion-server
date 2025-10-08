@@ -12,26 +12,9 @@ The **first GCS to connect** becomes the active controller, regardless of System
 ### System ID Priority (Fallback Only)
 System ID priority is only used when the active controller disconnects or relinquishes control:
 
-- **Higher System ID = Higher Priority** for fallback
-- When the active GCS disconnects, the backup GCS with the highest System ID takes over
-- A newly connected GCS with a high System ID will NOT automatically take control from an active GCS
-
-### Example Control Scenario
-```
-Initial State:
-- GCS System ID 100 connects first → ACTIVE CONTROLLER ✓
-
-GCS System ID 255 connects:
-- System ID 100 → Still ACTIVE CONTROLLER ✓
-- System ID 255 → Backup (receives telemetry only)
-
-System ID 100 disconnects:
-- System ID 255 → Now ACTIVE CONTROLLER ✓ (highest System ID)
-
-System ID 100 reconnects:
-- System ID 255 → Still ACTIVE CONTROLLER ✓
-- System ID 100 → Now backup (receives telemetry only)
-```
+- **Lower System ID = Higher Priority** for fallback
+- When the active GCS disconnects, the backup GCS with the lowest System ID takes over
+- A newly connected GCS with a lower System ID will NOT automatically take control from an active GCS
 
 ## Connection Requirements
 
@@ -43,7 +26,7 @@ System ID 100 reconnects:
 ### Heartbeat Monitoring
 - All GCS must send heartbeats regularly (default timeout: 5 seconds)
 - If the active controller stops sending heartbeats, it's automatically removed
-- The next highest-priority GCS immediately takes control
+- The backup GCS with the lowest System ID immediately takes control
 - Backup GCS that timeout are removed from the system
 
 ## What Each GCS Receives
@@ -66,7 +49,7 @@ The Relinquish Control command is sent as a MAVLink `COMMAND_LONG` message (mess
 
 ### What Happens When You Relinquish:
 1. Your GCS connection is removed from the system
-2. The backup GCS with the highest System ID becomes active
+2. The backup GCS with the lowest System ID becomes active
 3. Your next heartbeat will reconnect you as a new connection (as a backup, unless no other GCS exists)
 
 ### Special Case - Only One GCS:
@@ -78,7 +61,7 @@ If you're the only connected GCS and relinquish control:
 ## Troubleshooting
 
 ### My commands aren't working
-- Check if you're the active controller (first to connect, or highest System ID after previous controller disconnected)
+- Check if you're the active controller (first to connect, or lowest System ID after previous controller disconnected)
 - Verify your GCS is sending heartbeats regularly
 - If another GCS connected first, they have control until they disconnect or relinquish
 
@@ -98,5 +81,5 @@ If you're the only connected GCS and relinquish control:
 - **Relinquish command**: `COMMAND_LONG (76)` { command: 45000 }
 - **GCS detection**: MAVLink type `6` (minimal.MavType.GCS)
 - **Initial Control**: First controller to connect becomes the active controller.
-- **Fallback priority**: Backup controller with highest System ID becomes the active controller
+- **Fallback priority**: Backup controller with lowest System ID becomes the active controller
 - **Monitoring interval**: Every `2 seconds` (hard-coded in mavManager.js)

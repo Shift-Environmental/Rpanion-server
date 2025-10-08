@@ -237,13 +237,13 @@ class mavManager {
   }
 
   updateActiveGCS() {
-    // Find the alive GCS with the highest system ID
+    // Find the alive GCS with the LOWEST system ID (highest priority)
     let newActive = null
-    let highestSysId = -1
+    let lowestSysId = Infinity
 
     for (const [sysId, gcs] of this.gcsConnections.entries()) {
-      if (gcs.isAlive(this.gcsHeartbeatTimeout) && sysId > highestSysId) {
-        highestSysId = sysId
+      if (gcs.isAlive(this.gcsHeartbeatTimeout) && sysId < lowestSysId) {
+        lowestSysId = sysId
         newActive = sysId
       }
     }
@@ -276,7 +276,7 @@ class mavManager {
     console.log(`[MAV-MANAGER] Active: ${this.activeGCS || 'none'}`)
     const backups = Array.from(this.gcsConnections.keys())
       .filter(id => id !== this.activeGCS)
-      .sort((a, b) => b - a)
+      .sort((a, b) => a - b) // Sort ascending - lower IDs have higher priority
     if (backups.length > 0) {
       console.log(`[MAV-MANAGER] Backups (priority order): ${backups.join(', ')}`)
     }
@@ -322,7 +322,7 @@ class mavManager {
   getGCSStatus() {
     const backupGCS = Array.from(this.gcsConnections.values())
       .filter(gcs => gcs.sysId !== this.activeGCS)
-      .sort((a, b) => b.sysId - a.sysId) // Sort by system ID descending
+      .sort((a, b) => a.sysId - b.sysId) // Sort by system ID ascending - lower = higher priority
 
     return {
       activeGCS: this.activeGCS,
