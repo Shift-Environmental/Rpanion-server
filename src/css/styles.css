@@ -1,1 +1,33 @@
+.page-content-wrapper {
+   padding: 16px 16px;
+}
+
+.sidebar-logo {
+  padding: 1rem;
+  background: white;
+  border-bottom: 1px solid #dee2e6;
+}
+
+.sidebar-logo img {
+  width: 280px;
+  height: auto;
+}
+
+#sidebar-wrapper {
+   background-color: #d3ecf3 !important;
+}
+
+#sidebar-items {
+   width: 280px !important;
+}
+
+#sidebar-items .list-group-item {
+   padding-left: 20px;
+   background-color: #d3ecf3 !important;
+}
+
+#sidebar-items .list-group-item:hover {
+   background-color: black !important;
+   color: white;
+}
 
