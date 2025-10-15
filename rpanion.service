@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Environment=PORT=3000
 WorkingDirectory=/home/pi/OceanSled-Companion/Rpanion-server
-ExecStart=/usr/bin/npm run service
+ExecStart=/usr/bin/npm run server
 Restart=on-failure
 User=pi
 
