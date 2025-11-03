@@ -209,7 +209,7 @@ class mavManager {
       } else if (packet.header.msgid === common.StatusText.MSG_ID) {
         // Remove whitespace
         this.statusText += data.text.trim().replace(/[^ -~]+/g, '') + '\n'
-      } else if (packet.header.msgid === common.AutopilotVersion.MSG_ID) {
+      } else if (packet.header.msgid === common.AutopilotVersion?.MSG_ID) {
         // decode Ardupilot version
         this.fcVersion = this.decodeFlightSwVersion(data.flightSwVersion)
         console.log(`[VEHICLE] Flight controller version: ${this.fcVersion}`)
