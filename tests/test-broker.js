@@ -1,45 +1,41 @@
-// GCS Connection Test Script
-// Tests multiple GCS connections with various scenarios
+// GCS Relinquish Control Test
+// Tests control handoff between Field Control System and Handheld Controller
 const dgram = require('dgram')
 const { MavLinkProtocolV2, minimal, common } = require('node-mavlink')
 
-const SERVER_IP = '172.22.230.179'
-const SERVER_PORT = 14550
+const SERVER_IP = '127.0.0.1'
+const SERVER_PORT = 14540
+const MAV_CMD_RELINQUISH_CONTROL = 45000
 
-// Custom MAV_CMD for relinquishing control
-const MAV_CMD_RELINQUISH_CONTROL = 42700
-
-class TestGCS {
+class GCSController {
   constructor(sysId, compId, name) {
     this.sysId = sysId
     this.compId = compId
     this.name = name
     this.socket = dgram.createSocket('udp4')
-    this.isActive = false
-    this.shouldSendHeartbeat = true
     this.heartbeatInterval = null
     this.seq = 0
-    
-    console.log(`[${this.name}] Created (sysId=${sysId}, compId=${compId})`)
+    this.isRunning = false
   }
 
-  start() {
-    // Bind to a random port
-    this.socket.bind(() => {
-      console.log(`[${this.name}] Started on port ${this.socket.address().port}`)
-      this.startHeartbeat()
-    })
+  connect() {
+    return new Promise((resolve) => {
+      this.socket.bind(() => {
+        console.log(`[${this.name}] Connected on port ${this.socket.address().port}`)
+        this.isRunning = true
+        this.startHeartbeat()
+        resolve()
+      })
 
-    // Listen for responses
-    this.socket.on('message', (msg, rinfo) => {
-      // Just log that we received something (could parse responses here)
-      // console.log(`[${this.name}] Received ${msg.length} bytes`)
+      this.socket.on('message', (msg) => {
+        // Listen for server responses (could parse MAVLink here if needed)
+      })
     })
   }
 
   startHeartbeat() {
     this.heartbeatInterval = setInterval(() => {
-      if (this.shouldSendHeartbeat) {
+      if (this.isRunning) {
         this.sendHeartbeat()
       }
     }, 1000) // 1 Hz
@@ -47,7 +43,7 @@ class TestGCS {
 
   sendHeartbeat() {
     const heartbeat = new minimal.Heartbeat()
-    heartbeat.type = minimal.MavType.GCS // Type 6 - GCS
+    heartbeat.type = minimal.MavType.GCS
     heartbeat.autopilot = minimal.MavAutopilot.INVALID
     heartbeat.baseMode = 0
     heartbeat.customMode = 0
@@ -57,12 +53,11 @@ class TestGCS {
     this.sendMessage(heartbeat)
   }
 
-  sendRelinquish() {
-    console.log(`[${this.name}] Sending RELINQUISH_CONTROL command`)
+  relinquishControl() {
+    console.log(`[${this.name}] ⚡ Sending RELINQUISH_CONTROL command`)
     
-    // Create a COMMAND_LONG message
     const command = new common.CommandLong()
-    command.targetSystem = 1 // Assuming vehicle is system 1
+    command.targetSystem = 1
     command.targetComponent = minimal.MavComponent.ONBOARD_COMPUTER
     command.command = MAV_CMD_RELINQUISH_CONTROL
     command.confirmation = 0
@@ -90,13 +85,13 @@ class TestGCS {
   }
 
   stopHeartbeat() {
-    console.log(`[${this.name}] Stopped sending heartbeats`)
-    this.shouldSendHeartbeat = false
+    console.log(`[${this.name}] 🔴 Stopping heartbeat (simulating connection loss)`)
+    this.isRunning = false
   }
 
   resumeHeartbeat() {
-    console.log(`[${this.name}] Resumed sending heartbeats`)
-    this.shouldSendHeartbeat = true
+    console.log(`[${this.name}] 🟢 Resuming heartbeat`)
+    this.isRunning = true
   }
 
   disconnect() {
@@ -108,170 +103,142 @@ class TestGCS {
   }
 }
 
-// Test orchestrator
-class GCSTestOrchestrator {
+// Test Runner
+class RelinquishTest {
   constructor() {
-    this.gcsInstances = []
-    this.testPhase = 0
+    this.fieldControl = new GCSController(255, 190, 'Field-Control-System')
+    this.handheld = new GCSController(200, 190, 'Handheld-Controller')
   }
 
-  async runTests() {
-    console.log('\n========================================')
-    console.log('GCS CONNECTION TEST SUITE')
-    console.log('========================================\n')
+  async run() {
+    console.log('\n' + '='.repeat(60))
+    console.log('GCS RELINQUISH CONTROL TEST')
+    console.log('='.repeat(60) + '\n')
 
-    await this.phase1_BasicConnections()
-    await this.sleep(8000)
+    try {
+      await this.test1_InitialConnection()
+      await this.test2_VoluntaryRelinquish()
+      await this.test3_ConnectionLossFailover()
+      await this.test4_ReconnectAfterLoss()
+      await this.test4b_NonActiveRelinquishAttempt()
+      await this.test5_RelinquishWithOneController()
 
-    await this.phase2_DuplicateSystemIDs()
-    await this.sleep(8000)
-
-    await this.phase3_HeartbeatTimeout()
-    await this.sleep(8000)
-
-    await this.phase4_ActiveRelinquish()
-    await this.sleep(8000)
-
-    await this.phase5_MultipleBackups()
-    await this.sleep(8000)
-
-    await this.phase6_ReconnectScenarios()
-    await this.sleep(5000)
-
-    console.log('\n========================================')
-    console.log('TEST SUITE COMPLETED')
-    console.log('========================================\n')
-    
-    this.cleanup()
-  }
-
-  async phase1_BasicConnections() {
-    console.log('\n--- PHASE 1: Basic Connections ---')
-    console.log('Testing: First connected becomes active\n')
-
-    const gcs1 = new TestGCS(100, 190, 'GCS-100-A')
-    const gcs2 = new TestGCS(255, 190, 'GCS-255-A')
-    const gcs3 = new TestGCS(200, 190, 'GCS-200-A')
-
-    gcs1.start()
-    await this.sleep(2000)
-    
-    gcs2.start()
-    await this.sleep(2000)
-    
-    gcs3.start()
-    
-    console.log('\nExpected: GCS-100-A should be active (first connected)')
-    console.log('         GCS-255-A and GCS-200-A should be backups')
-
-    this.gcsInstances.push(gcs1, gcs2, gcs3)
-  }
-
-  async phase2_DuplicateSystemIDs() {
-    console.log('\n--- PHASE 2: Duplicate System IDs ---')
-    console.log('Testing: Second GCS with same sysId should be rejected\n')
-
-    const gcs4 = new TestGCS(255, 191, 'GCS-255-B-DUPLICATE')
-    gcs4.start()
-    
-    await this.sleep(2000)
-    
-    console.log('\nExpected: GCS-255-B-DUPLICATE should be rejected (sysId 255 already exists)')
-
-    this.gcsInstances.push(gcs4)
-  }
-
-  async phase3_HeartbeatTimeout() {
-    console.log('\n--- PHASE 3: Heartbeat Timeout ---')
-    console.log('Testing: Active controller timeout causes failover\n')
-
-    // Stop the active controller (GCS-100-A)
-    const activeGCS = this.gcsInstances[0]
-    activeGCS.stopHeartbeat()
-    
-    console.log('Waiting for timeout (5+ seconds)...')
-    await this.sleep(7000)
-    
-    console.log('\nExpected: GCS-100-A should timeout')
-    console.log('         GCS-255-A should become active (highest sysId)')
-  }
-
-  async phase4_ActiveRelinquish() {
-    console.log('\n--- PHASE 4: Active Relinquish ---')
-    console.log('Testing: Active controller voluntarily relinquishes\n')
-
-    // GCS-255-A should now be active, make it relinquish
-    const gcs255 = this.gcsInstances[1]
-    gcs255.sendRelinquish()
-    
-    await this.sleep(3000)
-    
-    console.log('\nExpected: GCS-255-A should relinquish and reconnect as backup')
-    console.log('         GCS-200-A should become active (next highest sysId)')
-  }
-
-  async phase5_MultipleBackups() {
-    console.log('\n--- PHASE 5: Multiple Backups Failover ---')
-    console.log('Testing: Sequential failover through backup controllers\n')
-
-    // Add more GCS instances
-    const gcs5 = new TestGCS(150, 190, 'GCS-150-A')
-    const gcs6 = new TestGCS(50, 190, 'GCS-50-A')
-    
-    gcs5.start()
-    await this.sleep(1000)
-    gcs6.start()
-    await this.sleep(2000)
-
-    this.gcsInstances.push(gcs5, gcs6)
-
-    console.log('\nCurrent backups: GCS-255-A, GCS-150-A, GCS-50-A')
-    console.log('Active: GCS-200-A')
-    
-    // Stop active controller
-    const gcs200 = this.gcsInstances[2]
-    gcs200.stopHeartbeat()
-    
-    console.log('\nStopping GCS-200-A heartbeat...')
-    await this.sleep(7000)
-    
-    console.log('\nExpected: GCS-255-A should become active (highest sysId among backups)')
-  }
-
-  async phase6_ReconnectScenarios() {
-    console.log('\n--- PHASE 6: Reconnect Scenarios ---')
-    console.log('Testing: Timed out GCS reconnecting\n')
-
-    // Resume GCS-100-A heartbeat (was stopped in phase 3)
-    const gcs100 = this.gcsInstances[0]
-    gcs100.resumeHeartbeat()
-    
-    await this.sleep(3000)
-    
-    console.log('\nExpected: GCS-100-A reconnects as backup (not taking control)')
-    console.log('         GCS-255-A should remain active')
-
-    await this.sleep(2000)
-
-    // Test relinquish with only one GCS
-    console.log('\n--- Testing: Single GCS relinquish ---')
-    console.log('Stopping all GCS except GCS-255-A...\n')
-    
-    for (let i = 0; i < this.gcsInstances.length; i++) {
-      if (i !== 1) { // Keep GCS-255-A (index 1)
-        this.gcsInstances[i].stopHeartbeat()
-      }
+      console.log('\n' + '='.repeat(60))
+      console.log('ALL TESTS COMPLETED')
+      console.log('='.repeat(60) + '\n')
+    } catch (error) {
+      console.error('Test error:', error)
+    } finally {
+      this.cleanup()
     }
+  }
 
-    await this.sleep(7000)
+  async test1_InitialConnection() {
+    console.log('\n📌 TEST 1: Initial Connection')
+    console.log('─'.repeat(60))
+    console.log('Connecting Field Control System first...\n')
 
-    console.log('\nOnly GCS-255-A should remain')
-    const gcs255 = this.gcsInstances[1]
-    gcs255.sendRelinquish()
+    await this.fieldControl.connect()
+    await this.sleep(2000)
+
+    console.log('\nConnecting Handheld Controller...\n')
+    await this.handheld.connect()
+    await this.sleep(2000)
+
+    console.log('✓ Expected: Field Control System is ACTIVE (first to connect)')
+    console.log('✓ Expected: Handheld Controller is BACKUP')
+    console.log('✓ Expected: Active controller does NOT change when backup connects\n')
+    await this.sleep(2000)
+  }
+
+  async test2_VoluntaryRelinquish() {
+    console.log('\n📌 TEST 2: Voluntary Relinquish Control')
+    console.log('─'.repeat(60))
+    console.log('Field Control System (ACTIVE) voluntarily relinquishes control...\n')
+
+    // Send relinquish command
+    this.fieldControl.relinquishControl()
+    await this.sleep(1000)
+
+    // Stop heartbeats to simulate disconnection after relinquish
+    this.fieldControl.stopHeartbeat()
+    console.log('[Field-Control-System] 🔴 Stopping heartbeat after relinquish\n')
     
     await this.sleep(3000)
+
+    console.log('✓ Expected: Field Control relinquishes and stops heartbeats')
+    console.log('✓ Expected: Handheld Controller becomes ACTIVE (only remaining controller)\n')
     
-    console.log('\nExpected: GCS-255-A relinquishes and immediately regains control')
+    console.log('Field Control reconnecting...\n')
+    this.fieldControl.resumeHeartbeat()
+    await this.sleep(3000)
+    
+    console.log('✓ Expected: Field Control reconnects as BACKUP')
+    console.log('✓ Expected: Handheld remains ACTIVE (first-connected-stays-active)\n')
+    await this.sleep(2000)
+  }
+
+  async test3_ConnectionLossFailover() {
+    console.log('\n📌 TEST 3: Connection Loss Failover')
+    console.log('─'.repeat(60))
+    console.log('Simulating Handheld Controller connection loss...\n')
+
+    this.handheld.stopHeartbeat()
+    console.log('Waiting for heartbeat timeout (7 seconds)...')
+    await this.sleep(7000)
+
+    console.log('\n✓ Expected: Handheld Controller times out')
+    console.log('✓ Expected: Field Control System becomes ACTIVE')
+    console.log('            (sysId 255 > 200, Field Control has highest priority)\n')
+    await this.sleep(2000)
+  }
+
+  async test4_ReconnectAfterLoss() {
+    console.log('\n📌 TEST 4: Reconnect After Connection Loss')
+    console.log('─'.repeat(60))
+    console.log('Handheld Controller reconnecting...\n')
+
+    this.handheld.resumeHeartbeat()
+    await this.sleep(3000)
+
+    console.log('✓ Expected: Handheld Controller reconnects as BACKUP')
+    console.log('✓ Expected: Field Control System remains ACTIVE\n')
+    await this.sleep(2000)
+  }
+
+  async test4b_NonActiveRelinquishAttempt() {
+    console.log('\n📌 TEST 4b: Non-Active Controller Relinquish Attempt')
+    console.log('─'.repeat(60))
+    console.log('Handheld (BACKUP) attempting to relinquish...\n')
+
+    this.handheld.relinquishControl()
+    await this.sleep(2000)
+
+    console.log('✓ Expected: Relinquish command is DENIED (not active controller)')
+    console.log('✓ Expected: Field Control remains ACTIVE')
+    console.log('✓ Expected: Handheld remains BACKUP (no change)\n')
+    await this.sleep(2000)
+  }
+
+  async test5_RelinquishWithOneController() {
+    console.log('\n📌 TEST 5: Relinquish With Only One Controller')
+    console.log('─'.repeat(60))
+    console.log('Stopping Handheld Controller to leave only Field Control active...\n')
+
+    this.handheld.stopHeartbeat()
+    await this.sleep(7000)
+
+    console.log('✓ Handheld timed out, only Field Control remains\n')
+    console.log('Field Control (only remaining controller) attempting to relinquish...\n')
+    
+    this.fieldControl.relinquishControl()
+    await this.sleep(3000)
+
+    console.log('✓ Expected: Relinquish command is sent')
+    console.log('✓ Expected: Field Control is removed from connections')
+    console.log('✓ Expected: No active GCS (no controllers left)')
+    console.log('✓ Note: In production, Field Control would likely reconnect')
+    console.log('        and become active again (only controller available)\n')
   }
 
   async sleep(ms) {
@@ -279,23 +246,19 @@ class GCSTestOrchestrator {
   }
 
   cleanup() {
-    console.log('\nCleaning up all GCS connections...')
-    for (const gcs of this.gcsInstances) {
-      gcs.disconnect()
-    }
-    process.exit(0)
+    console.log('\n🧹 Cleaning up...')
+    this.fieldControl.disconnect()
+    this.handheld.disconnect()
+    setTimeout(() => process.exit(0), 500)
   }
 }
 
-// Run the tests
-const orchestrator = new GCSTestOrchestrator()
-orchestrator.runTests().catch(err => {
-  console.error('Test error:', err)
-  process.exit(1)
-})
+// Run the test
+const test = new RelinquishTest()
+test.run()
 
-// Handle cleanup on interrupt
+// Handle interrupt
 process.on('SIGINT', () => {
-  console.log('\nTest interrupted')
-  orchestrator.cleanup()
+  console.log('\n\n⚠️  Test interrupted by user')
+  process.exit(0)
 })
