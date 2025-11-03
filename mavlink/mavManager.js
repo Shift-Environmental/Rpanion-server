@@ -127,6 +127,11 @@ class mavManager {
       }
       const data = packet.protocol.data(packet.payload, clazz)
 
+      // Log all messages for debugging
+      if (packet.header.msgid !== minimal.Heartbeat.MSG_ID) {
+        console.log(`[MSG-DEBUG] msgId=${packet.header.msgid} from sysId=${packet.header.sysid}`)
+      }
+
       // Handle GCS heartbeats first
       if (this.isGCS(data.type) && packet.header.msgid === minimal.Heartbeat.MSG_ID) {
         this.handleGCSHeartbeat(packet, data)
