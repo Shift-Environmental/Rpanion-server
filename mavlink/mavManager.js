@@ -127,7 +127,7 @@ class mavManager {
       }
       const data = packet.protocol.data(packet.payload, clazz)
 
-      // Log all messages for debugging
+      // Log all messages for debugging (except heartbeats to reduce noise)
       if (packet.header.msgid !== minimal.Heartbeat.MSG_ID) {
         console.log(`[MSG-DEBUG] msgId=${packet.header.msgid} from sysId=${packet.header.sysid}`)
       }
@@ -138,11 +138,22 @@ class mavManager {
         return // Don't process GCS heartbeats further
       }
 
+      // Determine if this message is from a known GCS
+      const isFromKnownGCS = this.gcsConnections.has(packet.header.sysid)
+      
       // Block ALL messages from non-active GCS (except heartbeats handled above)
-      if (this.gcsConnections.has(packet.header.sysid) && !this.isActiveGCS(packet.header.sysid)) {
+      if (isFromKnownGCS && !this.isActiveGCS(packet.header.sysid)) {
         // This is from a GCS but not the active one - block it
         console.log(`[MESSAGE-BLOCK] 🚫 Blocked msgId=${packet.header.msgid} from non-active GCS sysId=${packet.header.sysid}`)
         return
+      }
+      
+      // For messages from active GCS, add detailed logging for control messages
+      if (isFromKnownGCS && this.isActiveGCS(packet.header.sysid)) {
+        if (packet.header.msgid === common.ManualControl?.MSG_ID) {
+          console.log(`[MANUAL-CONTROL] ✓ From active GCS sysId=${packet.header.sysid}`)
+          console.log(`                 └─ x=${data.x}, y=${data.y}, z=${data.z}, r=${data.r}`)
+        }
       }
 
       // Handle relinquish control command (works with or without flight controller)
