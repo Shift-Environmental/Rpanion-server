@@ -1,5 +1,5 @@
-// Mavlink Manager with GCS Connection Management / Relinquish Control
-// Enhanced with detailed logging for debugging
+// Mavlink Manager with EXTENSIVE DEBUGGING for MANUAL_CONTROL
+// Enhanced with detailed logging at every stage
 const events = require('events')
 const udp = require('dgram')
 const { MavLinkPacketSplitter, MavLinkPacketParser, MavLinkProtocolV2, minimal, common, ardupilotmega, MavLinkProtocolV1 } = require('node-mavlink')
@@ -88,7 +88,16 @@ class mavManager {
 
     console.log(`[INIT] Listening on ${inudpIP}:${inudpPort}`)
 
+    // Track raw UDP packets for debugging
+    this.udpPacketCount = 0
+    this.lastManualControlTime = 0
+
     this.udpStream.on('message', (msg, rinfo) => {
+      this.udpPacketCount++
+      
+      // Log EVERY UDP packet for debugging
+      console.log(`[UDP-RAW] Packet #${this.udpPacketCount}: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`)
+      
       // calculate bytes/sec rate (once per 2 sec) and do DS requests
       if ((this.statusBytesPerSec.lastTime + 2000) < Date.now().valueOf()) {
         this.statusBytesPerSec.avgBytesSec = Math.round(1000 * this.statusBytesPerSec.bytes / (Date.now().valueOf() - this.statusBytesPerSec.lastTime))
@@ -110,36 +119,75 @@ class mavManager {
         this.eventEmitter.emit('linkready', true)
       }
 
+      console.log(`[UDP-WRITE] Writing to inStream...`)
       this.inStream.write(msg)
+      console.log(`[UDP-WRITE] Done writing to inStream`)
     })
 
     this.udpStream.bind(inudpPort, inudpIP)
 
-    this.mav = this.inStream.pipe(new MavLinkPacketSplitter()).pipe(new MavLinkPacketParser())
+    console.log('[INIT] Creating MAVLink pipeline...')
+    
+    // Add logging to the stream pipeline
+    const splitter = new MavLinkPacketSplitter()
+    const parser = new MavLinkPacketParser()
+    
+    splitter.on('data', (chunk) => {
+      console.log(`[SPLITTER] Got chunk of ${chunk.length} bytes`)
+    })
+    
+    parser.on('data', (packet) => {
+      console.log(`[PARSER] Parsed packet with msgId=${packet.header.msgid}`)
+    })
+
+    this.mav = this.inStream.pipe(splitter).pipe(parser)
+
+    console.log('[INIT] MAVLink pipeline created')
 
     // what to do when we get a message
     this.mav.on('data', packet => {
+      console.log(`[MAV-DATA] Received packet: msgId=${packet.header.msgid}, sysId=${packet.header.sysid}`)
+      
       const clazz = REGISTRY[packet.header.msgid]
       if (!clazz) {
+        console.log(`[MAV-DATA] ⚠️  No class found for msgId=${packet.header.msgid}`)
         // bad message - can't process here any further
         this.eventEmitter.emit('gotMessage', packet, null)
         return
       }
+      
+      console.log(`[MAV-DATA] Found class for msgId=${packet.header.msgid}`)
       const data = packet.protocol.data(packet.payload, clazz)
+      console.log(`[MAV-DATA] Parsed data for msgId=${packet.header.msgid}`)
 
-      // Log all messages for debugging (except heartbeats to reduce noise)
-      if (packet.header.msgid !== minimal.Heartbeat.MSG_ID) {
-        console.log(`[MSG-DEBUG] msgId=${packet.header.msgid} from sysId=${packet.header.sysid}`)
+      // Log all messages for debugging (except heartbeats and REMOTE_LOG_BLOCK_STATUS to reduce noise)
+      const isHeartbeat = packet.header.msgid === minimal.Heartbeat.MSG_ID
+      const isRemoteLogBlockStatus = packet.header.msgid === 185 // REMOTE_LOG_BLOCK_STATUS
+      
+      if (!isHeartbeat && !isRemoteLogBlockStatus) {
+        console.log(`[MSG-DEBUG] ✓✓✓ msgId=${packet.header.msgid} from sysId=${packet.header.sysid}`)
+        
+        // Special logging for MANUAL_CONTROL
+        if (packet.header.msgid === 69) {
+          const now = Date.now()
+          const gap = this.lastManualControlTime ? now - this.lastManualControlTime : 0
+          this.lastManualControlTime = now
+          console.log(`[MANUAL-CONTROL-RAW] 🎮 Received! Gap: ${gap}ms`)
+          console.log(`                     └─ sysId=${packet.header.sysid}, compId=${packet.header.compid}`)
+        }
       }
 
       // Handle GCS heartbeats first
       if (this.isGCS(data.type) && packet.header.msgid === minimal.Heartbeat.MSG_ID) {
+        console.log(`[MAV-DATA] Handling GCS heartbeat from sysId=${packet.header.sysid}`)
         this.handleGCSHeartbeat(packet, data)
+        console.log(`[MAV-DATA] Returning after GCS heartbeat`)
         return // Don't process GCS heartbeats further
       }
 
       // Determine if this message is from a known GCS
       const isFromKnownGCS = this.gcsConnections.has(packet.header.sysid)
+      console.log(`[MAV-DATA] isFromKnownGCS=${isFromKnownGCS} for sysId=${packet.header.sysid}`)
       
       // Block ALL messages from non-active GCS (except heartbeats handled above)
       if (isFromKnownGCS && !this.isActiveGCS(packet.header.sysid)) {
@@ -192,6 +240,7 @@ class mavManager {
 
       } else if (this.targetSystem !== packet.header.sysid || this.targetComponent !== packet.header.compid) {
         // don't use packets from other systems or components in Rpanion-server
+        console.log(`[MAV-DATA] Ignoring packet from other system/component: ${packet.header.sysid}/${packet.header.compid} (target: ${this.targetSystem}/${this.targetComponent})`)
         return
       }
 
@@ -226,6 +275,8 @@ class mavManager {
         console.log(`[VEHICLE] Flight controller version: ${this.fcVersion}`)
       }
     })
+    
+    console.log('[INIT] MAVLink data handler registered')
   }
 
   isGCS(mavType) {
